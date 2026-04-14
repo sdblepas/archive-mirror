@@ -1,251 +1,232 @@
-# archive-mirror
+# 🎙️ archive-mirror
 
-A production-grade background service that continuously mirrors an Internet
-Archive collection — by default the **Aadam Jacobs** concert archive — to local
-disk in FLAC format with full metadata tagging.
+[![Build & Publish Docker](https://github.com/sdblepas/archive-mirror/actions/workflows/build.yml/badge.svg)](https://github.com/sdblepas/archive-mirror/actions/workflows/build.yml)
+[![Docker Pulls](https://img.shields.io/docker/pulls/sdblepas/archive-mirror)](https://hub.docker.com/r/sdblepas/archive-mirror)
+[![Docker Image Size](https://img.shields.io/docker/image-size/sdblepas/archive-mirror/latest)](https://hub.docker.com/r/sdblepas/archive-mirror)
+[![Docker Version](https://img.shields.io/docker/v/sdblepas/archive-mirror?sort=semver&label=version)](https://hub.docker.com/r/sdblepas/archive-mirror/tags)
+[![Python](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![License](https://img.shields.io/github/license/sdblepas/archive-mirror)](LICENSE)
+[![Last Commit](https://img.shields.io/github/last-commit/sdblepas/archive-mirror)](https://github.com/sdblepas/archive-mirror/commits/main)
+
+> A self-hosted Docker service that automatically mirrors the **Aadam Jacobs Collection** from the Internet Archive — downloading every concert in FLAC, tagging the files, and keeping your library in sync.
 
 ---
 
-## Quick start
+## 🎸 About the Aadam Jacobs Collection
+
+Aadam Jacobs is Chicago's legendary "Taping Guy." For over two decades he attended a dozen or more gigs a month, setting up microphones at iconic venues like **Lounge Ax**, **The Metro**, **the Double Door**, and **Smart Bar** — capturing what no one else was preserving. His tapes document early performances by bands who went on to define alternative rock: **Nirvana, Sonic Youth, The Flaming Lips**, and thousands more.
+
+His archive spans roughly **10,000 tapes** — approximately **30,000 separate performances** — recorded from the early 1980s through the 2000s, first on cassette, then DAT, then digital.
+
+> *"My passion is really to document something that's otherwise not being documented. It's more a desire to collect and archive this stuff."*
+> — Aadam Jacobs, Glorious Noise, 2004
+
+In partnership with the **[Live Music Archive at the Internet Archive](https://archive.org/details/aadamjacobs)**, Jacobs' collection is being digitized and shared with the world by a volunteer team. The project began in the fall of 2024. His work was spotlighted in the 2023 documentary **Melomaniac** (dir. Katlin Schneider) and featured on Chicago Public Radio (WBEZ).
+
+This tool exists to make that archive permanently available on your own hardware.
+
+---
+
+## ✨ Features
+
+- 🔍 **Full collection discovery** — cursor-paginated scrape API, handles 30 000+ items
+- ⬇️ **FLAC-only downloads** — skips concerts with no lossless audio
+- ♻️ **Incremental sync** — only fetches what's new or changed, safe to restart anytime
+- 📂 **Clean folder structure** — `Artist - YYYY-MM-DD / 01 - Title - Artist.flac`
+- 🏷️ **Auto-tagging** — writes `TITLE`, `ARTIST`, `ALBUM`, `DATE`, `VENUE`, `TRACKNUMBER`
+- ✅ **Checksum validation** — MD5/SHA-1 verified against Internet Archive metadata
+- ⏸️ **Resume support** — interrupted downloads continue from where they stopped
+- 🔁 **Retry logic** — exponential back-off with configurable retry count
+- 🩺 **Health endpoint** — `GET /health` and `GET /metrics` on port `6547`
+- 🧾 **SQLite state** — full history of every item and track, survives restarts
+- 🐳 **Docker-native** — single `docker compose up -d` to run
+
+---
+
+## 🚀 Installation
+
+### Prerequisites
+
+- Docker ≥ 24
+- Docker Compose v2
+- ~500 GB+ free disk space (the full archive is large)
+
+### 1 — Create the data directories
+
+On your host (adjust the path to match your setup):
 
 ```bash
-cp .env.example .env
-# Edit .env if you want to change concurrency, sync interval, etc.
+mkdir -p /volume1/Docker/archive-mirror/music
+mkdir -p /volume1/Docker/archive-mirror/state
+```
 
+### 2 — Create `docker-compose.yml`
+
+```yaml
+version: "3.9"
+
+services:
+  archive-mirror:
+    image: sdblepas/archive-mirror:latest
+    container_name: archive-mirror
+    restart: unless-stopped
+
+    volumes:
+      - /volume1/Docker/archive-mirror/music:/data/music
+      - /volume1/Docker/archive-mirror/state:/data/state
+
+    environment:
+      COLLECTION: aadamjacobs
+      OUTPUT_DIR: /data/music
+      STATE_DIR: /data/state
+      SYNC_INTERVAL: "3600"      # seconds between syncs (0 = run once)
+      CONCURRENCY: "3"           # parallel downloads
+      RATE_LIMIT_DELAY: "1.0"    # seconds between requests per worker
+      REQUEST_TIMEOUT: "120"
+      RETRY_COUNT: "5"
+      LOG_LEVEL: INFO
+      DRY_RUN: "false"
+      CHECKSUM_MANIFEST: "true"
+      WEBHOOK_URL: ""
+      HEALTH_PORT: "6547"
+
+    ports:
+      - "6547:6547"
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:6547/health',timeout=5); sys.exit(0 if r.status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+```
+
+### 3 — Start the service
+
+```bash
 docker compose up -d
+```
+
+### 4 — Follow the logs
+
+```bash
 docker compose logs -f
 ```
 
-That's it. The service will:
-1. Discover every concert in the collection.
-2. Download all FLAC tracks for each concert.
-3. Write FLAC Vorbis comment tags.
-4. Write a `checksums.md5` manifest per concert folder.
-5. Sleep until the next sync interval, then repeat.
+You will see structured JSON logs like:
+
+```json
+{"event": "sync.start", "collection": "aadamjacobs", "dry_run": false}
+{"event": "sync.discovery_complete", "discovered": 412, "new": 412}
+{"event": "sync.processing", "identifier": "aj1990-11-09", "artist": "Nirvana", "tracks": 14}
+{"event": "download.complete", "filename": "01 - Blew - Nirvana.flac", "bytes": 42817234}
+{"event": "sync.item_complete", "folder": "Nirvana - 1990-11-09", "tracks": 14}
+{"event": "sync.complete", "tracks_downloaded": 3890, "failures": 0}
+```
+
+### 5 — Check health
+
+```bash
+curl http://localhost:6547/health
+# {"status": "ok", "sync_status": "sleeping", "next_sync_in_seconds": 3542}
+
+curl http://localhost:6547/metrics
+# {"last_sync": {"items_discovered": 412, "tracks_downloaded": 3890, "failures": 0}}
+```
 
 ---
 
-## Example folder tree
+## 📁 Output structure
 
 ```
 /data/music/
-├── Aadam Jacobs - 2005-06-15/
-│   ├── 01 - Opening Song - Aadam Jacobs.flac
-│   ├── 02 - Second Set Opener - Aadam Jacobs.flac
-│   ├── 03 - Closing Number - Aadam Jacobs.flac
+├── Nirvana - 1990-11-09/
+│   ├── 01 - Blew - Nirvana.flac
+│   ├── 02 - School - Nirvana.flac
+│   ├── 03 - Love Buzz - Nirvana.flac
 │   └── checksums.md5
-├── Aadam Jacobs - 2006-07-20/
-│   ├── 01 - Show Title - Aadam Jacobs.flac
+├── Sonic Youth - 1991-05-03/
+│   ├── 01 - Dirty Boots - Sonic Youth.flac
 │   └── checksums.md5
-└── Aadam Jacobs - unknown/
-    └── 01 - Untitled - Aadam Jacobs.flac
+└── The Flaming Lips - 1992-08-14/
+    ├── 01 - She Don't Use Jelly - The Flaming Lips.flac
+    └── checksums.md5
 ```
 
 ---
 
-## Architecture
+## ⚙️ Configuration reference
+
+| Variable | Default | Description |
+|---|---|---|
+| `COLLECTION` | `aadamjacobs` | Internet Archive collection ID |
+| `OUTPUT_DIR` | `/data/music` | Root directory for FLAC files |
+| `STATE_DIR` | `/data/state` | SQLite DB and health file location |
+| `SYNC_INTERVAL` | `3600` | Seconds between syncs (`0` = run once) |
+| `CONCURRENCY` | `3` | Parallel downloads (keep ≤ 5 to be polite) |
+| `RATE_LIMIT_DELAY` | `1.0` | Extra delay between requests per worker |
+| `REQUEST_TIMEOUT` | `120` | Per-request HTTP timeout (seconds) |
+| `RETRY_COUNT` | `5` | Max retries per download or metadata fetch |
+| `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+| `DRY_RUN` | `false` | List what would download, write nothing |
+| `CHECKSUM_MANIFEST` | `true` | Write `checksums.md5` per concert folder |
+| `WEBHOOK_URL` | *(empty)* | POST a JSON summary here after each sync |
+| `HEALTH_PORT` | `6547` | Port for `/health` and `/metrics` |
+
+---
+
+## 🗄️ How state works
+
+| Volume | Path | Contents |
+|---|---|---|
+| music | `/data/music` | FLAC files organised by concert |
+| state | `/data/state` | `mirror.db` (SQLite) |
+
+**SQLite tables:**
+
+- **`items`** — one row per concert: status, folder name, retry count, full IA metadata blob
+- **`tracks`** — one row per FLAC file: local path, checksum, download timestamp
+- **`sync_runs`** — history of every sync with summary statistics
+
+---
+
+## 🔄 How incremental sync works
+
+1. Every cycle pages through the IA scrape API and `upsert`s every identifier found — existing rows are untouched.
+2. The work list is built from rows with `status = pending` **or** `status = failed AND retry_count < RETRY_COUNT`.
+3. Items already `complete` or `no_flac` are **excluded at query time** — no HTTP requests made for them.
+4. Before opening any socket, the downloader checks whether the local file already exists with a matching size and checksum — if so it skips instantly.
+5. Interrupted downloads leave a `.part` file; on the next run an HTTP `Range` header resumes from the last written byte.
+
+---
+
+## 🏗️ Architecture
 
 ```
 src/
-├── config.py       Environment variable config dataclass
-├── logger.py       structlog → JSON to stdout
-├── database.py     aiosqlite wrapper (items / tracks / sync_runs tables)
-├── discovery.py    Internet Archive scrape API with cursor pagination
-├── metadata.py     IA metadata JSON parser → ConcertInfo / TrackInfo
-├── file_naming.py  Filename sanitisation, folder naming, deduplication
-├── downloader.py   Async httpx downloader: resume, checksum, retry
+├── config.py       Environment variable config
+├── logger.py       structlog → JSON stdout
+├── database.py     aiosqlite — items / tracks / sync_runs
+├── discovery.py    IA scrape API with cursor pagination
+├── metadata.py     IA metadata JSON → ConcertInfo / TrackInfo
+├── file_naming.py  Sanitisation, folder & track name generation
+├── downloader.py   Async httpx — resume, checksum, retry
 ├── tagger.py       mutagen FLAC Vorbis comment writer
-├── health.py       Threaded HTTP /health + /metrics endpoint
+├── health.py       Threaded /health + /metrics HTTP server
 ├── sync.py         SyncManager orchestrator
 ├── scheduler.py    Periodic asyncio loop
-└── main.py         Entry point, signal handling
+└── main.py         Entry point + signal handling
 ```
 
 ---
 
-## State and persistence
+## 📜 License
 
-Two Docker volumes are mounted:
-
-| Volume  | Mount          | Contents                              |
-|---------|----------------|---------------------------------------|
-| `music` | `/data/music`  | Downloaded FLAC files, organised by concert folder |
-| `state` | `/data/state`  | `mirror.db` (SQLite), `.health` file  |
-
-### SQLite schema
-
-**`items`** – one row per Internet Archive item (concert)
-
-| Column        | Description                                      |
-|---------------|--------------------------------------------------|
-| `identifier`  | IA item identifier (primary key)                 |
-| `status`      | `pending` / `no_flac` / `downloading` / `complete` / `failed` |
-| `has_flac`    | Whether the item has any FLAC files              |
-| `folder_name` | Folder name on disk                              |
-| `retry_count` | How many times the item has failed and been retried |
-| `raw_metadata`| Full JSON blob from the IA metadata API          |
-
-**`tracks`** – one row per FLAC file within an item
-
-| Column           | Description                                   |
-|------------------|-----------------------------------------------|
-| `item_identifier`| FK → items                                    |
-| `ia_filename`    | Remote filename on Internet Archive            |
-| `local_filename` | Sanitised filename on disk                    |
-| `status`         | `pending` / `complete` / `failed` / `skipped` |
-| `md5` / `sha1`   | Checksums from IA metadata                    |
-
-**`sync_runs`** – history of sync operations with summary statistics
-
----
-
-## How incremental sync works
-
-On every sync cycle:
-
-1. **Discovery** pages through the IA scrape API and calls `upsert_item` for
-   each identifier found.  If the identifier already exists in the DB, the
-   upsert is a no-op.  New identifiers are inserted with `status = pending`.
-
-2. **Work list** is built from rows where `status IN ('pending')` PLUS rows
-   where `status = 'failed' AND retry_count < RETRY_COUNT`.
-
-3. Items already `complete` or `no_flac` are **never revisited** — they are
-   simply excluded from the work list at query time.
-
-4. After a successful item sync, `status` is set to `complete`.  Subsequent
-   syncs skip it entirely regardless of whether new concerts have been
-   uploaded to the collection.
-
----
-
-## How duplicate downloads are avoided
-
-At three layers:
-
-1. **DB gate** — `status = 'complete'` items are excluded from the work list
-   before any HTTP requests are made.
-
-2. **File-level gate** — `downloader.py` checks whether the destination file
-   already exists with the correct size (and checksum if available) before
-   opening any network connection.  If valid, it returns `SKIPPED_EXISTING`
-   immediately.
-
-3. **Partial file resume** — If a `.part` file exists (from a previous
-   interrupted download), the downloader issues an HTTP `Range` request to
-   resume from the byte offset already written.  After completion, checksums
-   are verified against the IA metadata before the `.part` file is renamed
-   to its final name.
-
----
-
-## Configuration reference
-
-All settings are read from environment variables.
-
-| Variable           | Default       | Description                                        |
-|--------------------|---------------|----------------------------------------------------|
-| `COLLECTION`       | `aadamjacobs` | Internet Archive collection identifier             |
-| `OUTPUT_DIR`       | `/data/music` | Root directory for downloaded files                |
-| `STATE_DIR`        | `/data/state` | Directory for SQLite DB and health file            |
-| `SYNC_INTERVAL`    | `3600`        | Seconds between syncs (0 = run once)               |
-| `CONCURRENCY`      | `3`           | Max simultaneous track downloads                   |
-| `RATE_LIMIT_DELAY` | `1.0`         | Min seconds between requests per worker            |
-| `REQUEST_TIMEOUT`  | `120`         | Per-request HTTP timeout in seconds                |
-| `RETRY_COUNT`      | `5`           | Max retries per download or metadata fetch         |
-| `LOG_LEVEL`        | `INFO`        | `DEBUG` / `INFO` / `WARNING` / `ERROR`             |
-| `DRY_RUN`          | `false`       | List what would be downloaded without writing      |
-| `CHECKSUM_MANIFEST`| `true`        | Write `checksums.md5` to each concert folder       |
-| `WEBHOOK_URL`      | *(empty)*     | Optional URL to POST a JSON summary after each sync|
-| `HEALTH_PORT`      | `8080`        | Port for the `/health` and `/metrics` endpoints    |
-
----
-
-## Health check
-
-```bash
-curl http://localhost:8080/health
-# {"status": "ok", "sync_status": "sleeping", "next_sync_in_seconds": 3542}
-
-curl http://localhost:8080/metrics
-# {"last_sync": {"items_discovered": 412, "tracks_downloaded": 3890, ...}}
-```
-
-Docker's own `HEALTHCHECK` instruction polls `/health` every 30 seconds.
-
----
-
-## Observability
-
-All log lines are JSON, emitted to stdout.  Key event names:
-
-| Event                   | When                                      |
-|-------------------------|-------------------------------------------|
-| `sync.start`            | Beginning of a sync cycle                 |
-| `sync.discovery_complete` | All items discovered                    |
-| `sync.no_flac`          | Item has no FLAC files — skipped          |
-| `sync.processing`       | Starting downloads for an item            |
-| `sync.item_complete`    | All tracks for an item downloaded         |
-| `sync.item_partial`     | Some tracks failed — will retry           |
-| `download.skip_existing`| File already present and valid — skipped  |
-| `download.retry`        | Transient failure — retrying              |
-| `download.failed`       | All retries exhausted                     |
-| `sync.complete`         | Sync cycle finished with statistics       |
-| `scheduler.sleeping`    | Waiting until next sync                   |
-
----
-
-## Mounting host directories instead of named volumes
-
-Edit `docker-compose.yml` and uncomment the `driver_opts` sections:
-
-```yaml
-volumes:
-  music:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /mnt/nas/archive/music
-  state:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /mnt/nas/archive/state
-```
-
----
-
-## Running without Docker
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-export OUTPUT_DIR=./music
-export STATE_DIR=./state
-export SYNC_INTERVAL=0       # run once
-export DRY_RUN=true          # preview only
-
-python -m src.main
-```
-
----
-
-## Edge cases handled
-
-| Scenario                           | Handling                                                  |
-|------------------------------------|-----------------------------------------------------------|
-| Missing FLAC files in item         | Item marked `no_flac`; clearly logged; never retried      |
-| Partial / interrupted download     | `.part` file resumed via `Range` header on next run       |
-| Checksum mismatch                  | File deleted, re-downloaded up to `RETRY_COUNT` times     |
-| Missing date in metadata           | Folder named `Artist - unknown`                          |
-| Missing venue                      | Album tag omits venue; no crash                           |
-| Duplicate track titles             | `(2)`, `(3)` suffixes appended by `deduplicate_filenames` |
-| Track numbers absent or "1/12"     | `_fill_track_numbers` assigns sequential numbers          |
-| Multiple artist names (list)       | `_coerce_str` takes first element                         |
-| 429 rate limiting                  | Respects `Retry-After` header; backs off exponentially    |
-| Container restart mid-sync         | `status = 'downloading'` items reset to `pending` on next startup (retry path) |
-| Very large collections (>10 000)   | Scrape API cursor pagination handles unlimited results    |
+MIT — see [LICENSE](LICENSE).
