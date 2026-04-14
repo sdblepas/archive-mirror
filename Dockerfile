@@ -38,18 +38,10 @@ RUN mkdir -p /data/music /data/state \
 
 USER mirror
 
-# Health check via the built-in HTTP endpoint
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD python - <<'EOF'
-import urllib.request, sys
-try:
-    r = urllib.request.urlopen("http://localhost:8080/health", timeout=5)
-    sys.exit(0 if r.status == 200 else 1)
-except Exception:
-    sys.exit(1)
-EOF
+    CMD python -c "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:6547/health',timeout=5); sys.exit(0 if r.status==200 else 1)"
 
-EXPOSE 8080
+EXPOSE 6547
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
