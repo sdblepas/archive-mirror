@@ -1,12 +1,5 @@
 """
 Fetches and parses Internet Archive item metadata.
-
-The IA metadata API returns a JSON document with two top-level keys:
-  metadata  – dict of item-level fields (title, creator, date, venue, …)
-  files     – list of file objects (name, format, size, md5, sha1, title, track, …)
-
-This module normalises the raw IA data into clean Python dataclasses so the
-rest of the pipeline does not have to handle IA-specific quirks.
 """
 from __future__ import annotations
 
@@ -25,14 +18,10 @@ log = get_logger(__name__)
 _METADATA_URL = "https://archive.org/metadata/{identifier}"
 
 
-# ---------------------------------------------------------------------------
-# Dataclasses
-# ---------------------------------------------------------------------------
-
 @dataclass
 class TrackInfo:
     ia_filename: str
-    format: str           # "Flac", "VBR MP3", …
+    format: str
     title: Optional[str]
     track_number: Optional[int]
     size: Optional[int]
@@ -46,16 +35,12 @@ class ConcertInfo:
     identifier: str
     title: str
     artist: str
-    date: str             # "YYYY-MM-DD", "YYYY-MM" or "YYYY" if partial
+    date: str
     venue: Optional[str]
     description: Optional[str]
     flac_tracks: list[TrackInfo] = field(default_factory=list)
     raw: dict = field(default_factory=dict)
 
-
-# ---------------------------------------------------------------------------
-# MetadataFetcher
-# ---------------------------------------------------------------------------
 
 class MetadataFetcher:
     def __init__(self, config: Config, client: httpx.AsyncClient) -> None:
@@ -63,11 +48,6 @@ class MetadataFetcher:
         self._client = client
 
     async def fetch(self, identifier: str) -> Optional[ConcertInfo]:
-        """Fetch IA metadata for *identifier* and return a ConcertInfo.
-
-        Returns None if the item cannot be found (404).
-        Raises on other network/server errors after retries.
-        """
         url = _METADATA_URL.format(identifier=identifier)
         raw = await self._get_json_with_retry(url, identifier)
         if raw is None:
@@ -87,7 +67,7 @@ class MetadataFetcher:
                     log.warning("metadata.not_found", identifier=identifier)
                     return None
                 if response.status_code == 429:
-                    wait = 30 * attempt
+                    wait = int(response.headers.get("Retry-After", str(30 * attempt)))
                     log.warning(
                         "metadata.rate_limited",
                         identifier=identifier,
@@ -97,7 +77,7 @@ class MetadataFetcher:
                     continue
                 response.raise_for_status()
                 return response.json()
-            except (httpx.HTTPError, Exception) as exc:
+            except (httpx.HTTPError, OSError, asyncio.TimeoutError) as exc:
                 last_exc = exc
                 if attempt <= self._cfg.retry_count:
                     wait = min(4 * 2 ** (attempt - 1), 120)
@@ -116,7 +96,7 @@ class MetadataFetcher:
 
 
 # ---------------------------------------------------------------------------
-# Pure parsing logic (no I/O)
+# Pure parsing
 # ---------------------------------------------------------------------------
 
 def _parse(identifier: str, raw: dict) -> ConcertInfo:
@@ -124,56 +104,40 @@ def _parse(identifier: str, raw: dict) -> ConcertInfo:
     files = raw.get("files", [])
 
     artist = _coerce_str(
-        meta.get("creator") or meta.get("artist") or meta.get("uploader") or "Unknown Artist"
-    )
-    title = _coerce_str(
-        meta.get("title") or identifier
-    )
-    date = _normalise_date(
-        _coerce_str(meta.get("date") or meta.get("year") or "")
-    )
-    venue = _coerce_str(meta.get("venue") or meta.get("coverage") or None)
-    description = _coerce_str(meta.get("description") or None)
+        meta.get("creator") or meta.get("artist") or meta.get("uploader")
+    ) or "Unknown Artist"
+    title = _coerce_str(meta.get("title")) or identifier
+    date = _normalise_date(_coerce_str(meta.get("date") or meta.get("year")))
+    venue = _coerce_str(meta.get("venue") or meta.get("coverage"))
+    description = _coerce_str(meta.get("description"))
 
     flac_tracks: list[TrackInfo] = []
     for f in files:
-        fmt = _coerce_str(f.get("format", ""))
-        # Internet Archive normalises FLAC format as "Flac"
+        fmt = _coerce_str(f.get("format", "")) or ""
         if fmt.lower() not in ("flac", "flac audio"):
             continue
-        name = _coerce_str(f.get("name", ""))
+        name = _coerce_str(f.get("name", "")) or ""
         if not name:
             continue
-
-        track_title = _coerce_str(
-            f.get("title") or _stem(name)
-        )
-        track_num = _parse_track_number(f.get("track"))
-        size = _safe_int(f.get("size"))
-        md5 = _coerce_str(f.get("md5") or None)
-        sha1 = _coerce_str(f.get("sha1") or None)
-        # Some items have per-track creator overrides
-        track_artist = _coerce_str(f.get("creator") or f.get("artist") or None)
-
         flac_tracks.append(
             TrackInfo(
                 ia_filename=name,
                 format=fmt,
-                title=track_title,
-                track_number=track_num,
-                size=size,
-                md5=md5,
-                sha1=sha1,
-                artist=track_artist,
+                title=_coerce_str(f.get("title")) or _stem(name),
+                track_number=_parse_track_number(f.get("track")),
+                size=_safe_int(f.get("size")),
+                md5=_coerce_str(f.get("md5")),
+                sha1=_coerce_str(f.get("sha1")),
+                artist=_coerce_str(f.get("creator") or f.get("artist")),
             )
         )
 
-    # Sort by track number where available, then filename
     flac_tracks.sort(
-        key=lambda t: (t.track_number if t.track_number is not None else 9999, t.ia_filename)
+        key=lambda t: (
+            t.track_number if t.track_number is not None else 9999,
+            t.ia_filename,
+        )
     )
-
-    # Assign sequential numbers to tracks that are missing them
     _fill_track_numbers(flac_tracks)
 
     return ConcertInfo(
@@ -189,10 +153,6 @@ def _parse(identifier: str, raw: dict) -> ConcertInfo:
 
 
 def _fill_track_numbers(tracks: list[TrackInfo]) -> None:
-    """Ensure every track has a number.  Gaps or collisions → sequential fill."""
-    missing = [t for t in tracks if t.track_number is None]
-    if not missing:
-        return
     existing = {t.track_number for t in tracks if t.track_number is not None}
     counter = 1
     for t in tracks:
@@ -205,7 +165,6 @@ def _fill_track_numbers(tracks: list[TrackInfo]) -> None:
 
 
 def _coerce_str(val: object) -> Optional[str]:
-    """IA metadata values can be lists – take the first element."""
     if val is None:
         return None
     if isinstance(val, list):
@@ -217,21 +176,15 @@ def _coerce_str(val: object) -> Optional[str]:
 
 
 def _normalise_date(raw: Optional[str]) -> str:
-    """Return YYYY-MM-DD, YYYY-MM, or YYYY.  Falls back to 'unknown'."""
     if not raw:
         return "unknown"
-    # Strip time component if present
     raw = raw.split("T")[0].split(" ")[0]
-    # Match YYYY-MM-DD
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
         return raw
-    # Match YYYY-MM
     if re.fullmatch(r"\d{4}-\d{2}", raw):
         return raw
-    # Match YYYY
     if re.fullmatch(r"\d{4}", raw):
         return raw
-    # Try to extract a date-like substring
     m = re.search(r"(\d{4}-\d{2}-\d{2})", raw)
     if m:
         return m.group(1)
@@ -242,11 +195,9 @@ def _normalise_date(raw: Optional[str]) -> str:
 
 
 def _parse_track_number(raw: object) -> Optional[int]:
-    """Parse "1", "01", "1/12", or None."""
     s = _coerce_str(raw)
     if not s:
         return None
-    # "1/12" → 1
     s = s.split("/")[0].strip()
     try:
         return int(s)
@@ -264,6 +215,5 @@ def _safe_int(val: object) -> Optional[int]:
 
 
 def _stem(filename: str) -> str:
-    """Return filename without extension."""
     i = filename.rfind(".")
     return filename[:i] if i > 0 else filename

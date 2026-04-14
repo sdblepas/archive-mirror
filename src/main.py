@@ -1,13 +1,8 @@
 """
-Entry point for the archive-mirror service.
+Entry point.
 
-Lifecycle:
-  1. Load Config from environment variables.
-  2. Configure structured logging.
-  3. Start health-check HTTP server.
-  4. Open SQLite database (creates schema on first run).
-  5. Run the sync scheduler (blocks until done or interrupted).
-  6. Clean shutdown.
+Runs the FastAPI web UI (via uvicorn) and the sync scheduler concurrently
+inside a single asyncio event loop — they share the same DB connection.
 """
 from __future__ import annotations
 
@@ -15,11 +10,13 @@ import asyncio
 import signal
 import sys
 
+import uvicorn
+
 from .config import Config
 from .database import Database
-from .health import HealthServer
 from .logger import configure_logging, get_logger
 from .scheduler import run_forever
+from .web import create_app, set_health
 
 log = get_logger(__name__)
 
@@ -30,17 +27,14 @@ async def _main() -> None:
 
     log.info(
         "service.start",
-        collection=config.collection,
+        collections=config.collections,
         output_dir=str(config.output_dir),
         state_dir=str(config.state_dir),
         sync_interval=config.sync_interval,
         concurrency=config.max_workers,
         dry_run=config.dry_run,
+        web_port=config.web_port,
     )
-
-    # Health server runs in a background daemon thread
-    health = HealthServer(config.health_port)
-    health.start()
 
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
@@ -53,36 +47,54 @@ async def _main() -> None:
         loop.add_signal_handler(sig, _handle_signal, sig)
 
     async with Database(config.db_path) as db:
-        # Run the scheduler in a task so we can cancel it on shutdown
+        app = create_app(config, db)
+
+        uv_config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=config.web_port,
+            log_level="warning",
+            access_log=False,
+        )
+        server = uvicorn.Server(uv_config)
+
+        set_health("ok", sync_status="starting")
+
         scheduler_task = asyncio.create_task(
-            run_forever(config, db, health),
-            name="scheduler",
+            run_forever(config, db), name="scheduler"
+        )
+        web_task = asyncio.create_task(
+            server.serve(), name="web"
         )
         shutdown_task = asyncio.create_task(
-            shutdown_event.wait(),
-            name="shutdown-watcher",
+            shutdown_event.wait(), name="shutdown-watcher"
         )
 
         done, pending = await asyncio.wait(
-            {scheduler_task, shutdown_task},
+            {scheduler_task, web_task, shutdown_task},
             return_when=asyncio.FIRST_COMPLETED,
         )
 
+        # Graceful shutdown
+        server.should_exit = True
         for task in pending:
             task.cancel()
             try:
                 await task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, Exception):
                 pass
 
-        # Re-raise any exception from the scheduler
+        # Surface any unexpected exception from scheduler or web
         for task in done:
-            if task.get_name() == "scheduler" and not task.cancelled():
+            if not task.cancelled() and task.get_name() in ("scheduler", "web"):
                 exc = task.exception()
                 if exc:
-                    raise exc
+                    log.error(
+                        "service.task_failed",
+                        task=task.get_name(),
+                        error=str(exc),
+                    )
 
-    health.stop()
     log.info("service.stopped")
 
 

@@ -3,11 +3,8 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /build
 
-# Install only what's needed to compile wheels (mutagen is pure Python,
-# but httpx needs hpack if http2 is used)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends gcc \
+ && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --upgrade pip \
@@ -19,27 +16,28 @@ FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="archive-mirror" \
       org.opencontainers.image.description="Continuous mirror of an Internet Archive collection" \
-      org.opencontainers.image.source="https://github.com/your-org/archive-mirror"
+      org.opencontainers.image.source="https://github.com/sdblepas/archive-mirror"
 
-# Create a non-root user for the service
 RUN useradd --system --uid 1000 --create-home mirror
 
 WORKDIR /app
 
-# Copy installed packages from builder
 COPY --from=builder /install /usr/local
-
-# Copy source
 COPY src/ ./src/
 
-# Create data directories owned by the service user
 RUN mkdir -p /data/music /data/state \
  && chown -R mirror:mirror /data
 
 USER mirror
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD python -c "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:6547/health',timeout=5); sys.exit(0 if r.status==200 else 1)"
+# Healthcheck reads HEALTH_PORT / WEB_PORT from the environment so it works
+# regardless of which port the operator configures.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD python -c "\
+import urllib.request, sys, os; \
+port = os.getenv('WEB_PORT', os.getenv('HEALTH_PORT', '6547')); \
+r = urllib.request.urlopen(f'http://localhost:{port}/health', timeout=5); \
+sys.exit(0 if r.status == 200 else 1)"
 
 EXPOSE 6547
 

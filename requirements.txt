@@ -1,5 +1,9 @@
-# HTTP client (async, sync, streaming)
-httpx[http2]>=0.27.0
+# HTTP client (async, streaming)
+httpx>=0.27.0
+
+# Web UI + REST API
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
 
 # Async SQLite
 aiosqlite>=0.20.0
@@ -12,6 +16,3 @@ mutagen>=1.47.0
 
 # Structured JSON logging
 structlog>=24.1.0
-
-# Standard library only beyond this point – no additional pinned deps needed
-# for retry logic; we implement it ourselves to avoid version conflicts.

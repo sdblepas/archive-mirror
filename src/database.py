@@ -24,45 +24,65 @@ from .logger import get_logger
 log = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
+# Allowed column names (prevent column-name injection in dynamic UPDATE)
+# ---------------------------------------------------------------------------
+_ALLOWED_ITEM_COLS = frozenset({
+    "title", "date", "artist", "venue", "description",
+    "discovered_at", "processed_at", "status", "has_flac",
+    "folder_name", "retry_count", "last_error", "raw_metadata", "collection",
+})
+
+_ALLOWED_TRACK_COLS = frozenset({
+    "local_filename", "local_path", "title", "track_number", "format",
+    "size", "md5", "sha1", "status", "downloaded_at", "retry_count",
+    "last_error",
+})
+
+_ALLOWED_SYNCRUN_COLS = frozenset({
+    "completed_at", "items_discovered", "items_new", "items_with_flac",
+    "items_skipped", "items_completed", "tracks_downloaded",
+    "tracks_failed", "status", "error_msg",
+})
+
+# ---------------------------------------------------------------------------
 # Schema DDL
 # ---------------------------------------------------------------------------
-SCHEMA = """
+_SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS items (
     identifier      TEXT PRIMARY KEY,
+    collection      TEXT NOT NULL DEFAULT '',
     title           TEXT,
-    date            TEXT,           -- e.g. "1990-11-09"
+    date            TEXT,
     artist          TEXT,
     venue           TEXT,
     description     TEXT,
     discovered_at   TEXT NOT NULL,
     processed_at    TEXT,
     status          TEXT NOT NULL DEFAULT 'pending',
-    -- pending | no_flac | downloading | complete | failed
     has_flac        INTEGER NOT NULL DEFAULT 0,
-    folder_name     TEXT,           -- actual folder on disk
+    folder_name     TEXT,
     retry_count     INTEGER NOT NULL DEFAULT 0,
     last_error      TEXT,
-    raw_metadata    TEXT            -- full JSON blob from IA
+    raw_metadata    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tracks (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     item_identifier TEXT NOT NULL REFERENCES items(identifier),
-    ia_filename     TEXT NOT NULL,  -- remote filename on IA
-    local_filename  TEXT,           -- sanitised filename on disk
-    local_path      TEXT,           -- path relative to output_dir
+    ia_filename     TEXT NOT NULL,
+    local_filename  TEXT,
+    local_path      TEXT,
     title           TEXT,
     track_number    INTEGER,
-    format          TEXT,           -- "Flac", "VBR MP3", …
-    size            INTEGER,        -- bytes (from IA metadata)
+    format          TEXT,
+    size            INTEGER,
     md5             TEXT,
     sha1            TEXT,
     status          TEXT NOT NULL DEFAULT 'pending',
-    -- pending | complete | failed | skipped
     downloaded_at   TEXT,
     retry_count     INTEGER NOT NULL DEFAULT 0,
     last_error      TEXT,
@@ -82,43 +102,66 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     tracks_downloaded   INTEGER DEFAULT 0,
     tracks_failed       INTEGER DEFAULT 0,
     status              TEXT NOT NULL DEFAULT 'running',
-    -- running | complete | failed | interrupted
     error_msg           TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_items_status         ON items(status);
+CREATE INDEX IF NOT EXISTS idx_items_collection     ON items(collection);
 CREATE INDEX IF NOT EXISTS idx_tracks_item          ON tracks(item_identifier);
 CREATE INDEX IF NOT EXISTS idx_tracks_status        ON tracks(status);
 CREATE INDEX IF NOT EXISTS idx_tracks_item_status   ON tracks(item_identifier, status);
 """
+
+# ---------------------------------------------------------------------------
+# Migrations applied to existing databases on startup
+# ---------------------------------------------------------------------------
+_MIGRATIONS = [
+    # v0.1.x → v0.2.x: add collection column to items
+    "ALTER TABLE items ADD COLUMN collection TEXT NOT NULL DEFAULT ''",
+]
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _validate_columns(cols: set[str], allowed: frozenset[str], context: str) -> None:
+    bad = cols - allowed
+    if bad:
+        raise ValueError(f"Disallowed column(s) in {context}: {bad}")
+
+
 # ---------------------------------------------------------------------------
 # Database class
 # ---------------------------------------------------------------------------
 class Database:
-    """Async wrapper around a single aiosqlite connection.
-
-    Open with ``async with Database(path) as db:``.
-    All write methods are serialised through an asyncio.Lock so concurrent
-    asyncio tasks can safely call them without WAL contention.
-    """
-
     def __init__(self, db_path: Path) -> None:
         self._path = db_path
         self._conn: Optional[aiosqlite.Connection] = None
         self._write_lock = asyncio.Lock()
 
     async def connect(self) -> None:
-        self._conn = await aiosqlite.connect(str(self._path))
-        self._conn.row_factory = aiosqlite.Row
-        await self._conn.executescript(SCHEMA)
-        await self._conn.commit()
+        conn = await aiosqlite.connect(str(self._path))
+        try:
+            conn.row_factory = aiosqlite.Row
+            await conn.executescript(_SCHEMA)
+            await conn.commit()
+            await self._run_migrations(conn)
+        except Exception:
+            await conn.close()
+            raise
+        self._conn = conn
         log.info("database.connected", path=str(self._path))
+
+    async def _run_migrations(self, conn: aiosqlite.Connection) -> None:
+        for sql in _MIGRATIONS:
+            try:
+                await conn.execute(sql)
+                await conn.commit()
+                log.info("database.migration_applied", sql=sql[:60])
+            except Exception:
+                # Column already exists — expected on all runs after the first
+                pass
 
     async def close(self) -> None:
         if self._conn:
@@ -132,11 +175,9 @@ class Database:
     async def __aexit__(self, *_: Any) -> None:
         await self.close()
 
-    # ── Helpers ─────────────────────────────────────────────────────────────
-
-    def _require_conn(self) -> aiosqlite.Connection:
+    def _conn_or_raise(self) -> aiosqlite.Connection:
         if self._conn is None:
-            raise RuntimeError("Database not connected")
+            raise RuntimeError("Database not connected — call connect() first")
         return self._conn
 
     # ── items ────────────────────────────────────────────────────────────────
@@ -145,6 +186,7 @@ class Database:
         self,
         *,
         identifier: str,
+        collection: str = "",
         title: Optional[str] = None,
         date: Optional[str] = None,
         artist: Optional[str] = None,
@@ -152,29 +194,24 @@ class Database:
         description: Optional[str] = None,
         raw_metadata: Optional[dict] = None,
     ) -> bool:
-        """Insert item if not present; returns True if it was new."""
-        conn = self._require_conn()
+        """Insert item if not present. Returns True if it was new."""
+        conn = self._conn_or_raise()
         async with self._write_lock:
-            cursor = await conn.execute(
+            cur = await conn.execute(
                 "SELECT 1 FROM items WHERE identifier = ?", (identifier,)
             )
-            exists = await cursor.fetchone() is not None
+            exists = await cur.fetchone() is not None
             if not exists:
                 await conn.execute(
                     """
                     INSERT INTO items
-                        (identifier, title, date, artist, venue, description,
-                         discovered_at, raw_metadata)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        (identifier, collection, title, date, artist, venue,
+                         description, discovered_at, raw_metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        identifier,
-                        title,
-                        date,
-                        artist,
-                        venue,
-                        description,
-                        _now(),
+                        identifier, collection, title, date, artist, venue,
+                        description, _now(),
                         json.dumps(raw_metadata) if raw_metadata else None,
                     ),
                 )
@@ -182,22 +219,23 @@ class Database:
             return not exists
 
     async def get_item(self, identifier: str) -> Optional[dict]:
-        conn = self._require_conn()
-        cursor = await conn.execute(
+        conn = self._conn_or_raise()
+        cur = await conn.execute(
             "SELECT * FROM items WHERE identifier = ?", (identifier,)
         )
-        row = await cursor.fetchone()
+        row = await cur.fetchone()
         return dict(row) if row else None
 
     async def update_item(self, identifier: str, **kwargs: Any) -> None:
-        conn = self._require_conn()
         if not kwargs:
             return
+        _validate_columns(set(kwargs.keys()), _ALLOWED_ITEM_COLS, "items")
+        conn = self._conn_or_raise()
         sets = ", ".join(f"{k} = ?" for k in kwargs)
-        values = list(kwargs.values()) + [identifier]
         async with self._write_lock:
             await conn.execute(
-                f"UPDATE items SET {sets} WHERE identifier = ?", values
+                f"UPDATE items SET {sets} WHERE identifier = ?",
+                [*kwargs.values(), identifier],
             )
             await conn.commit()
 
@@ -212,7 +250,7 @@ class Database:
     ) -> None:
         kwargs: dict[str, Any] = {"status": status}
         if error is not None:
-            kwargs["last_error"] = error[:2000]  # cap error length
+            kwargs["last_error"] = error[:2000]
         if folder_name is not None:
             kwargs["folder_name"] = folder_name
         if has_flac is not None:
@@ -220,44 +258,80 @@ class Database:
         if status in ("complete", "no_flac", "failed"):
             kwargs["processed_at"] = _now()
         if status == "failed":
-            # Increment retry_count atomically
-            conn = self._require_conn()
+            conn = self._conn_or_raise()
+            _validate_columns(set(kwargs.keys()), _ALLOWED_ITEM_COLS, "items")
+            sets = ", ".join(f"{k} = ?" for k in kwargs)
             async with self._write_lock:
-                sets = ", ".join(f"{k} = ?" for k in kwargs)
                 await conn.execute(
                     f"UPDATE items SET {sets}, retry_count = retry_count + 1 "
                     f"WHERE identifier = ?",
-                    list(kwargs.values()) + [identifier],
+                    [*kwargs.values(), identifier],
                 )
                 await conn.commit()
             return
         await self.update_item(identifier, **kwargs)
 
     async def get_items_by_status(self, *statuses: str) -> list[dict]:
-        conn = self._require_conn()
+        conn = self._conn_or_raise()
         placeholders = ",".join("?" * len(statuses))
-        cursor = await conn.execute(
-            f"SELECT * FROM items WHERE status IN ({placeholders})", list(statuses)
+        cur = await conn.execute(
+            f"SELECT * FROM items WHERE status IN ({placeholders})",
+            list(statuses),
         )
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in await cur.fetchall()]
 
     async def get_items_for_retry(self, max_retries: int) -> list[dict]:
-        conn = self._require_conn()
-        cursor = await conn.execute(
+        conn = self._conn_or_raise()
+        cur = await conn.execute(
             "SELECT * FROM items WHERE status = 'failed' AND retry_count < ?",
             (max_retries,),
         )
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in await cur.fetchall()]
 
     async def count_items_by_status(self) -> dict[str, int]:
-        conn = self._require_conn()
-        cursor = await conn.execute(
+        conn = self._conn_or_raise()
+        cur = await conn.execute(
             "SELECT status, COUNT(*) as n FROM items GROUP BY status"
         )
-        rows = await cursor.fetchall()
-        return {r["status"]: r["n"] for r in rows}
+        return {r["status"]: r["n"] for r in await cur.fetchall()}
+
+    async def get_items_paginated(
+        self,
+        *,
+        status: Optional[str] = None,
+        collection: Optional[str] = None,
+        search: Optional[str] = None,
+        page: int = 1,
+        per_page: int = 50,
+    ) -> tuple[list[dict], int]:
+        """Return (items, total_count) with optional filters."""
+        conn = self._conn_or_raise()
+        conditions: list[str] = []
+        params: list[Any] = []
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if collection:
+            conditions.append("collection = ?")
+            params.append(collection)
+        if search:
+            conditions.append(
+                "(title LIKE ? OR artist LIKE ? OR venue LIKE ? OR identifier LIKE ?)"
+            )
+            term = f"%{search}%"
+            params.extend([term, term, term, term])
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        cur = await conn.execute(
+            f"SELECT COUNT(*) as n FROM items {where}", params
+        )
+        total = (await cur.fetchone())["n"]
+        offset = (page - 1) * per_page
+        cur = await conn.execute(
+            f"SELECT * FROM items {where} ORDER BY date DESC, identifier "
+            f"LIMIT ? OFFSET ?",
+            params + [per_page, offset],
+        )
+        return [dict(r) for r in await cur.fetchall()], total
 
     # ── tracks ───────────────────────────────────────────────────────────────
 
@@ -273,7 +347,7 @@ class Database:
         md5: Optional[str] = None,
         sha1: Optional[str] = None,
     ) -> None:
-        conn = self._require_conn()
+        conn = self._conn_or_raise()
         async with self._write_lock:
             await conn.execute(
                 """
@@ -289,32 +363,24 @@ class Database:
                     md5          = excluded.md5,
                     sha1         = excluded.sha1
                 """,
-                (
-                    item_identifier,
-                    ia_filename,
-                    title,
-                    track_number,
-                    format,
-                    size,
-                    md5,
-                    sha1,
-                ),
+                (item_identifier, ia_filename, title, track_number,
+                 format, size, md5, sha1),
             )
             await conn.commit()
 
     async def update_track(
         self, item_identifier: str, ia_filename: str, **kwargs: Any
     ) -> None:
-        conn = self._require_conn()
         if not kwargs:
             return
+        _validate_columns(set(kwargs.keys()), _ALLOWED_TRACK_COLS, "tracks")
+        conn = self._conn_or_raise()
         sets = ", ".join(f"{k} = ?" for k in kwargs)
-        values = list(kwargs.values()) + [item_identifier, ia_filename]
         async with self._write_lock:
             await conn.execute(
                 f"UPDATE tracks SET {sets} "
                 f"WHERE item_identifier = ? AND ia_filename = ?",
-                values,
+                [*kwargs.values(), item_identifier, ia_filename],
             )
             await conn.commit()
 
@@ -327,8 +393,7 @@ class Database:
         local_path: str,
     ) -> None:
         await self.update_track(
-            item_identifier,
-            ia_filename,
+            item_identifier, ia_filename,
             status="complete",
             local_filename=local_filename,
             local_path=local_path,
@@ -338,14 +403,12 @@ class Database:
     async def mark_track_failed(
         self, item_identifier: str, ia_filename: str, error: str
     ) -> None:
-        conn = self._require_conn()
+        conn = self._conn_or_raise()
         async with self._write_lock:
             await conn.execute(
                 """
                 UPDATE tracks
-                SET status = 'failed',
-                    last_error = ?,
-                    retry_count = retry_count + 1
+                SET status = 'failed', last_error = ?, retry_count = retry_count + 1
                 WHERE item_identifier = ? AND ia_filename = ?
                 """,
                 (error[:2000], item_identifier, ia_filename),
@@ -353,26 +416,25 @@ class Database:
             await conn.commit()
 
     async def get_tracks_for_item(self, item_identifier: str) -> list[dict]:
-        conn = self._require_conn()
-        cursor = await conn.execute(
-            "SELECT * FROM tracks WHERE item_identifier = ? ORDER BY track_number, ia_filename",
+        conn = self._conn_or_raise()
+        cur = await conn.execute(
+            "SELECT * FROM tracks WHERE item_identifier = ? "
+            "ORDER BY track_number, ia_filename",
             (item_identifier,),
         )
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in await cur.fetchall()]
 
     async def count_tracks(self) -> dict[str, int]:
-        conn = self._require_conn()
-        cursor = await conn.execute(
+        conn = self._conn_or_raise()
+        cur = await conn.execute(
             "SELECT status, COUNT(*) as n FROM tracks GROUP BY status"
         )
-        rows = await cursor.fetchall()
-        return {r["status"]: r["n"] for r in rows}
+        return {r["status"]: r["n"] for r in await cur.fetchall()}
 
     # ── sync_runs ────────────────────────────────────────────────────────────
 
     async def start_sync_run(self, run_id: str) -> None:
-        conn = self._require_conn()
+        conn = self._conn_or_raise()
         async with self._write_lock:
             await conn.execute(
                 "INSERT INTO sync_runs (run_id, started_at) VALUES (?, ?)",
@@ -381,14 +443,15 @@ class Database:
             await conn.commit()
 
     async def update_sync_run(self, run_id: str, **kwargs: Any) -> None:
-        conn = self._require_conn()
         if not kwargs:
             return
+        _validate_columns(set(kwargs.keys()), _ALLOWED_SYNCRUN_COLS, "sync_runs")
+        conn = self._conn_or_raise()
         sets = ", ".join(f"{k} = ?" for k in kwargs)
-        values = list(kwargs.values()) + [run_id]
         async with self._write_lock:
             await conn.execute(
-                f"UPDATE sync_runs SET {sets} WHERE run_id = ?", values
+                f"UPDATE sync_runs SET {sets} WHERE run_id = ?",
+                [*kwargs.values(), run_id],
             )
             await conn.commit()
 
@@ -397,10 +460,13 @@ class Database:
             run_id, status=status, completed_at=_now(), **stats
         )
 
-    async def get_last_sync(self) -> Optional[dict]:
-        conn = self._require_conn()
-        cursor = await conn.execute(
-            "SELECT * FROM sync_runs ORDER BY id DESC LIMIT 1"
+    async def get_recent_syncs(self, limit: int = 10) -> list[dict]:
+        conn = self._conn_or_raise()
+        cur = await conn.execute(
+            "SELECT * FROM sync_runs ORDER BY id DESC LIMIT ?", (limit,)
         )
-        row = await cursor.fetchone()
-        return dict(row) if row else None
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def get_last_sync(self) -> Optional[dict]:
+        syncs = await self.get_recent_syncs(limit=1)
+        return syncs[0] if syncs else None

@@ -1,32 +1,18 @@
 """
 SyncManager – the main orchestrator.
 
-One full sync cycle:
-  1. Discover all items in the IA collection (cursor-paginated scrape API).
-  2. Upsert each discovered item into the DB (new → pending).
-  3. Build a work list: pending + failed-with-retries-remaining.
-  4. For each work item (concurrency limited):
-       a. Fetch item metadata from IA.
-       b. If no FLAC files → mark no_flac, skip.
-       c. Create destination folder.
-       d. Download each FLAC track (with resume & checksum).
-       e. Write FLAC tags.
-       f. Write checksum manifest (optional).
-       g. Mark item complete in DB.
-  5. Emit summary statistics.
-  6. Optionally POST a webhook notification.
+Supports multiple collections via config.collections (comma-separated).
+One full sync cycle per collection, sequential to avoid hammering IA.
 """
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import aiofiles
 import httpx
 
 from .config import Config
@@ -39,32 +25,26 @@ from .file_naming import (
     make_folder_name,
     make_track_filename,
 )
-from .health import HealthServer
 from .logger import get_logger
 from .metadata import ConcertInfo, MetadataFetcher
+from .tagger import tag_flac
 
 log = get_logger(__name__)
 
 
 class SyncManager:
-    def __init__(
-        self,
-        config: Config,
-        db: Database,
-        health: HealthServer,
-    ) -> None:
+    def __init__(self, config: Config, db: Database) -> None:
         self._cfg = config
         self._db = db
-        self._health = health
 
     # ── Public entry point ───────────────────────────────────────────────────
 
     async def run_sync(self) -> dict:
-        """Run a full sync cycle.  Returns summary statistics."""
+        """Run a full sync across all configured collections."""
         run_id = str(uuid.uuid4())
         await self._db.start_sync_run(run_id)
 
-        stats = {
+        stats: dict = {
             "run_id": run_id,
             "items_discovered": 0,
             "items_new": 0,
@@ -75,8 +55,12 @@ class SyncManager:
             "tracks_failed": 0,
         }
 
-        log.info("sync.start", run_id=run_id, dry_run=self._cfg.dry_run)
-        self._health.set_healthy(sync_status="running", run_id=run_id)
+        log.info(
+            "sync.start",
+            run_id=run_id,
+            collections=self._cfg.collections,
+            dry_run=self._cfg.dry_run,
+        )
 
         limits = httpx.Limits(
             max_keepalive_connections=10,
@@ -86,35 +70,34 @@ class SyncManager:
         headers = {
             "User-Agent": (
                 "archive-mirror/1.0 "
-                "(https://github.com/your-org/archive-mirror; respectful bot)"
+                "(https://github.com/sdblepas/archive-mirror; respectful bot)"
             )
         }
 
         async with httpx.AsyncClient(
-            headers=headers,
-            follow_redirects=True,
-            limits=limits,
+            headers=headers, follow_redirects=True, limits=limits
         ) as client:
             discoverer = Discoverer(self._cfg, client)
             metadata_fetcher = MetadataFetcher(self._cfg, client)
             downloader = Downloader(self._cfg, client)
 
-            # ── Phase 1: Discovery ───────────────────────────────────────
-            log.info("sync.discovery_start", collection=self._cfg.collection)
-            async for item_stub in discoverer.iter_items():
-                identifier = item_stub.get("identifier", "")
-                if not identifier:
-                    continue
-                stats["items_discovered"] += 1
-
-                is_new = await self._db.upsert_item(
-                    identifier=identifier,
-                    title=item_stub.get("title"),
-                    date=item_stub.get("date"),
-                    artist=item_stub.get("creator"),
-                )
-                if is_new:
-                    stats["items_new"] += 1
+            # ── Phase 1: Discover all collections ────────────────────────
+            for collection in self._cfg.collections:
+                log.info("sync.discovery_start", collection=collection)
+                async for item_stub in discoverer.iter_items(collection):
+                    identifier = item_stub.get("identifier", "")
+                    if not identifier:
+                        continue
+                    stats["items_discovered"] += 1
+                    is_new = await self._db.upsert_item(
+                        identifier=identifier,
+                        collection=collection,
+                        title=item_stub.get("title"),
+                        date=item_stub.get("date"),
+                        artist=item_stub.get("creator"),
+                    )
+                    if is_new:
+                        stats["items_new"] += 1
 
             log.info(
                 "sync.discovery_complete",
@@ -127,10 +110,10 @@ class SyncManager:
                 items_new=stats["items_new"],
             )
 
-            # ── Phase 2: Build work list ─────────────────────────────────
+            # ── Phase 2: Build work list ──────────────────────────────────
             pending = await self._db.get_items_by_status("pending")
             retryable = await self._db.get_items_for_retry(self._cfg.retry_count)
-            # Deduplicate (an item shouldn't be in both, but be safe)
+
             seen: set[str] = set()
             work_list: list[dict] = []
             for item in pending + retryable:
@@ -138,14 +121,6 @@ class SyncManager:
                     seen.add(item["identifier"])
                     work_list.append(item)
 
-            # Items already complete or no_flac are intentionally excluded
-            skipped_count = (
-                stats["items_discovered"]
-                - len(work_list)
-                - stats["items_new"]  # new ones ARE in work_list
-                + len(pending)        # correct for new items counted above
-            )
-            # Simpler: just count complete + no_flac items
             status_counts = await self._db.count_items_by_status()
             stats["items_skipped"] = (
                 status_counts.get("complete", 0) + status_counts.get("no_flac", 0)
@@ -154,17 +129,16 @@ class SyncManager:
             log.info(
                 "sync.work_list_ready",
                 to_process=len(work_list),
-                skipped=stats["items_skipped"],
+                already_skipped=stats["items_skipped"],
             )
 
             if not work_list:
                 log.info("sync.nothing_to_do")
                 await self._db.finish_sync_run(run_id, status="complete", **stats)
-                self._health.set_healthy(sync_status="idle")
                 return stats
 
             if self._cfg.dry_run:
-                log.info("sync.dry_run", would_process=len(work_list))
+                log.info("sync.dry_run_mode", would_process=len(work_list))
                 for item in work_list:
                     log.info(
                         "dry_run.would_process",
@@ -172,17 +146,16 @@ class SyncManager:
                         title=item.get("title"),
                     )
                 await self._db.finish_sync_run(run_id, status="complete", **stats)
-                self._health.set_healthy(sync_status="idle")
                 return stats
 
-            # ── Phase 3: Process items concurrently ──────────────────────
+            # ── Phase 3: Process items with bounded concurrency ───────────
             sem = asyncio.Semaphore(self._cfg.max_workers)
+            lock = asyncio.Lock()
 
             async def process_one(item: dict) -> None:
                 async with sem:
-                    s = await self._process_item(
-                        item, metadata_fetcher, downloader
-                    )
+                    s = await self._process_item(item, metadata_fetcher, downloader)
+                async with lock:
                     stats["items_with_flac"] += s.get("has_flac", 0)
                     stats["items_completed"] += s.get("completed", 0)
                     stats["tracks_downloaded"] += s.get("tracks_downloaded", 0)
@@ -190,17 +163,11 @@ class SyncManager:
 
             await asyncio.gather(*(process_one(item) for item in work_list))
 
-        # ── Phase 4: Finalize ────────────────────────────────────────────
         log.info("sync.complete", **stats)
         await self._db.finish_sync_run(run_id, status="complete", **stats)
-        self._health.set_healthy(
-            sync_status="idle",
-            last_sync=datetime.now(timezone.utc).isoformat(),
-        )
-        self._health.update_metrics(last_sync=stats)
 
         if self._cfg.webhook_url:
-            await self._post_webhook(stats)
+            await self._post_webhook(client, stats)
 
         return stats
 
@@ -213,22 +180,22 @@ class SyncManager:
         downloader: Downloader,
     ) -> dict:
         identifier = item["identifier"]
-        result = {"has_flac": 0, "completed": 0, "tracks_downloaded": 0, "tracks_failed": 0}
+        result = {
+            "has_flac": 0,
+            "completed": 0,
+            "tracks_downloaded": 0,
+            "tracks_failed": 0,
+        }
 
-        # Mark as downloading so a crashed run shows the right state
         await self._db.mark_item_status(identifier, "downloading")
 
         # ── Fetch metadata ───────────────────────────────────────────────
         try:
             concert = await metadata_fetcher.fetch(identifier)
-        except Exception as exc:
-            log.error(
-                "sync.metadata_error",
-                identifier=identifier,
-                error=str(exc),
-            )
+        except Exception:
+            log.exception("sync.metadata_error", identifier=identifier)
             await self._db.mark_item_status(
-                identifier, "failed", error=f"metadata fetch failed: {exc}"
+                identifier, "failed", error="metadata fetch failed"
             )
             result["tracks_failed"] += 1
             return result
@@ -239,7 +206,6 @@ class SyncManager:
             )
             return result
 
-        # ── Update DB with rich metadata ─────────────────────────────────
         await self._db.update_item(
             identifier,
             title=concert.title,
@@ -250,16 +216,9 @@ class SyncManager:
             raw_metadata=json.dumps(concert.raw),
         )
 
-        # ── Check for FLAC ───────────────────────────────────────────────
         if not concert.flac_tracks:
-            log.info(
-                "sync.no_flac",
-                identifier=identifier,
-                title=concert.title,
-            )
-            await self._db.mark_item_status(
-                identifier, "no_flac", has_flac=False
-            )
+            log.info("sync.no_flac", identifier=identifier, title=concert.title)
+            await self._db.mark_item_status(identifier, "no_flac", has_flac=False)
             return result
 
         result["has_flac"] = 1
@@ -273,7 +232,6 @@ class SyncManager:
             tracks=len(concert.flac_tracks),
         )
 
-        # ── Upsert tracks into DB ────────────────────────────────────────
         for track in concert.flac_tracks:
             await self._db.upsert_track(
                 item_identifier=identifier,
@@ -286,7 +244,6 @@ class SyncManager:
                 sha1=track.sha1,
             )
 
-        # ── Build local filenames (deduplicated) ─────────────────────────
         folder_name = make_folder_name(concert.artist, concert.date)
         dest_dir = self._cfg.output_dir / folder_name
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -294,7 +251,7 @@ class SyncManager:
         total = len(concert.flac_tracks)
         raw_names = [
             make_track_filename(
-                t.track_number,  # type: ignore[arg-type]  # filled by _fill_track_numbers
+                t.track_number,  # type: ignore[arg-type]
                 t.title or "untitled",
                 t.artist or concert.artist,
                 total_tracks=total,
@@ -302,10 +259,8 @@ class SyncManager:
             for t in concert.flac_tracks
         ]
         dedup_names = deduplicate_filenames(raw_names)
-
         album_tag = build_album_tag(concert.artist, concert.date, concert.venue)
 
-        # ── Download each track ──────────────────────────────────────────
         checksum_entries: list[tuple[str, str]] = []
         tracks_ok = 0
         tracks_fail = 0
@@ -336,23 +291,27 @@ class SyncManager:
                     local_path=relative,
                 )
 
-                # Tag the file (skip on SKIPPED_EXISTING only if tags are already OK)
                 final_path = dest_dir / local_filename
-                if final_path.exists():
-                    _tag_safe(
-                        final_path,
-                        title=track.title or "untitled",
-                        artist=track.artist or concert.artist,
-                        album=album_tag,
-                        date=concert.date,
-                        venue=concert.venue,
-                        track_number=track.track_number or 1,
-                        total_tracks=total,
+                tagged = _tag_safe(
+                    final_path,
+                    title=track.title or "untitled",
+                    artist=track.artist or concert.artist,
+                    album=album_tag,
+                    date=concert.date,
+                    venue=concert.venue,
+                    track_number=track.track_number or 1,
+                    total_tracks=total,
+                    identifier=identifier,
+                )
+                if not tagged:
+                    log.warning(
+                        "sync.tag_skipped",
                         identifier=identifier,
+                        filename=local_filename,
                     )
 
-                    if self._cfg.write_checksum_manifest and track.md5:
-                        checksum_entries.append((local_filename, track.md5))
+                if self._cfg.write_checksum_manifest and track.md5:
+                    checksum_entries.append((local_filename, track.md5))
 
             else:
                 tracks_fail += 1
@@ -368,17 +327,12 @@ class SyncManager:
                     error=outcome.error,
                 )
 
-        # ── Write checksum manifest ──────────────────────────────────────
         if self._cfg.write_checksum_manifest and checksum_entries:
             await write_checksum_manifest(dest_dir, checksum_entries)
 
-        # ── Mark item status ─────────────────────────────────────────────
         if tracks_fail == 0:
             await self._db.mark_item_status(
-                identifier,
-                "complete",
-                has_flac=True,
-                folder_name=folder_name,
+                identifier, "complete", has_flac=True, folder_name=folder_name
             )
             result["completed"] = 1
             log.info(
@@ -408,22 +362,45 @@ class SyncManager:
 
     # ── Webhook ──────────────────────────────────────────────────────────────
 
-    async def _post_webhook(self, stats: dict) -> None:
+    async def _post_webhook(self, client: httpx.AsyncClient, stats: dict) -> None:
+        """Reuse the existing pooled client for the webhook POST."""
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                await client.post(self._cfg.webhook_url, json=stats)
+            await client.post(
+                self._cfg.webhook_url, json=stats, timeout=15
+            )
             log.info("webhook.sent", url=self._cfg.webhook_url)
-        except Exception as exc:
-            log.warning("webhook.failed", error=str(exc))
+        except Exception:
+            log.exception("webhook.failed", url=self._cfg.webhook_url)
 
 
 # ---------------------------------------------------------------------------
-# Tagging helper (non-raising)
+# Tag helper (non-raising, returns bool)
 # ---------------------------------------------------------------------------
 
-def _tag_safe(path: Path, **kwargs) -> None:  # type: ignore[type-arg]
-    from .tagger import tag_flac
+def _tag_safe(
+    path: Path,
+    *,
+    title: str,
+    artist: str,
+    album: str,
+    date: str,
+    venue: Optional[str],
+    track_number: int,
+    total_tracks: int,
+    identifier: str,
+) -> bool:
     try:
-        tag_flac(path, **kwargs)
-    except Exception as exc:
-        log.warning("sync.tag_error", path=str(path), error=str(exc))
+        return tag_flac(
+            path,
+            title=title,
+            artist=artist,
+            album=album,
+            date=date,
+            venue=venue,
+            track_number=track_number,
+            total_tracks=total_tracks,
+            identifier=identifier,
+        )
+    except Exception:
+        log.exception("sync.tag_error", path=str(path))
+        return False
