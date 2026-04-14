@@ -106,18 +106,22 @@ CREATE TABLE IF NOT EXISTS sync_runs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_items_status         ON items(status);
-CREATE INDEX IF NOT EXISTS idx_items_collection     ON items(collection);
 CREATE INDEX IF NOT EXISTS idx_tracks_item          ON tracks(item_identifier);
 CREATE INDEX IF NOT EXISTS idx_tracks_status        ON tracks(status);
 CREATE INDEX IF NOT EXISTS idx_tracks_item_status   ON tracks(item_identifier, status);
 """
+# NOTE: idx_items_collection is intentionally NOT here — it references the
+# `collection` column which may not exist on pre-v0.2 databases.
+# The index is created in _MIGRATIONS, after the ALTER TABLE that adds the column.
 
 # ---------------------------------------------------------------------------
-# Migrations applied to existing databases on startup
+# Migrations applied to existing databases on startup (in order)
 # ---------------------------------------------------------------------------
 _MIGRATIONS = [
     # v0.1.x → v0.2.x: add collection column to items
     "ALTER TABLE items ADD COLUMN collection TEXT NOT NULL DEFAULT ''",
+    # Create the index now that the column is guaranteed to exist
+    "CREATE INDEX IF NOT EXISTS idx_items_collection ON items(collection)",
 ]
 
 

@@ -15,7 +15,7 @@ from .config import Config
 from .database import Database
 from .logger import get_logger
 from .sync import SyncManager
-from .web import set_health
+from .web_state import set_health
 
 log = get_logger(__name__)
 
