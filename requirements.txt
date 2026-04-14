@@ -1,0 +1,17 @@
+# HTTP client (async, sync, streaming)
+httpx[http2]>=0.27.0
+
+# Async SQLite
+aiosqlite>=0.20.0
+
+# Async file I/O
+aiofiles>=23.2.1
+
+# FLAC tag writing
+mutagen>=1.47.0
+
+# Structured JSON logging
+structlog>=24.1.0
+
+# Standard library only beyond this point – no additional pinned deps needed
+# for retry logic; we implement it ourselves to avoid version conflicts.

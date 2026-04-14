@@ -1,0 +1,57 @@
+version: "3.9"
+
+services:
+  archive-mirror:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: archive-mirror:latest
+    container_name: archive-mirror
+    restart: unless-stopped
+
+    # ── Volumes ──────────────────────────────────────────────────────────
+    volumes:
+      - /volume1/Docker/archive-mirror/music:/data/music
+      - /volume1/Docker/archive-mirror/state:/data/state
+
+    # ── Environment ───────────────────────────────────────────────────────
+    environment:
+      COLLECTION: aadamjacobs
+      OUTPUT_DIR: /data/music
+      STATE_DIR: /data/state
+      SYNC_INTERVAL: "3600"
+      CONCURRENCY: "3"
+      RATE_LIMIT_DELAY: "1.0"
+      REQUEST_TIMEOUT: "120"
+      RETRY_COUNT: "5"
+      LOG_LEVEL: INFO
+      DRY_RUN: "false"
+      CHECKSUM_MANIFEST: "true"
+      WEBHOOK_URL: ""
+      HEALTH_PORT: "6547"
+
+    # ── Health endpoint ───────────────────────────────────────────────────
+    ports:
+      - "6547:6547"
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:6547/health',timeout=5); sys.exit(0 if r.status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+    # ── Resource limits (tune to your host) ──────────────────────────────
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 512M
+
+    # ── Logging ───────────────────────────────────────────────────────────
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"

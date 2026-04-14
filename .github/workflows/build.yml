@@ -1,0 +1,214 @@
+name: Build & Publish Docker
+
+# ─────────────────────────────────────────────────────────────────
+#  COMMIT MESSAGE CONVENTIONS
+#
+#  fix: ...        → patch   (v1.2.3 → v1.2.4)
+#  feat: ...       → minor   (v1.2.3 → v1.3.0)
+#  feat!: ...      → major   (v1.2.3 → v2.0.0)
+#  refactor: ...   → patch
+#  chore: ...      → patch
+#  docs: ...       → patch
+#  (anything else) → patch
+#
+#  Main branch   → latest + vX.Y.Z tag pushed to Docker Hub
+#  Non-main      → STG + <branch>-<sha>  (no version tag created)
+# ─────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches:
+      - "**"
+
+permissions:
+  contents: write
+  security-events: write
+
+jobs:
+
+  # ─────────────────────────────────────────────
+  # 1. SECURITY SCAN  (runs in parallel with test)
+  # ─────────────────────────────────────────────
+  scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: 1
+
+  # ─────────────────────────────────────────────
+  # 2. UNIT TESTS  (runs in parallel with scan)
+  # ─────────────────────────────────────────────
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        run: pytest --tb=short -v
+
+  # ─────────────────────────────────────────────
+  # 3. COMPUTE VERSION
+  # ─────────────────────────────────────────────
+  version:
+    name: Compute Version
+    needs: [scan, test]
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      is_main:  ${{ steps.ctx.outputs.is_main }}
+    steps:
+      - name: Checkout (full history for tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect branch context
+        id: ctx
+        run: |
+          IS_MAIN=$( [ "${{ github.ref }}" = "refs/heads/main" ] && echo "true" || echo "false" )
+          echo "is_main=$IS_MAIN" >> $GITHUB_OUTPUT
+
+      # ── Main: parse commit message → bump type ──
+      - name: Parse commit message
+        id: parse
+        if: steps.ctx.outputs.is_main == 'true'
+        run: |
+          MSG=$(git log -1 --pretty=%s)
+          echo "Commit: $MSG"
+
+          if echo "$MSG" | grep -qE '^[a-z]+!:'; then
+            echo "bump=major" >> $GITHUB_OUTPUT
+          elif echo "$MSG" | grep -qE '^feat(\(.+\))?:'; then
+            echo "bump=minor" >> $GITHUB_OUTPUT
+          else
+            echo "bump=patch" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Main: compute new vX.Y.Z and push tag ──
+      - name: Bump version
+        id: bump
+        if: steps.ctx.outputs.is_main == 'true'
+        run: |
+          BUMP="${{ steps.parse.outputs.bump }}"
+
+          LATEST=$(git tag --list 'v*.*.*' | sort -V | tail -1)
+          [ -z "$LATEST" ] && LATEST="v0.0.0"
+          echo "Latest tag: $LATEST  |  Bump: $BUMP"
+
+          VER="${LATEST#v}"
+          MAJOR=$(echo "$VER" | cut -d. -f1)
+          MINOR=$(echo "$VER" | cut -d. -f2)
+          PATCH=$(echo "$VER" | cut -d. -f3)
+
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR+1)); PATCH=0           ;;
+            patch) PATCH=$((PATCH+1))                    ;;
+          esac
+
+          NEW="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "New version: $NEW"
+          echo "version=$NEW" >> $GITHUB_OUTPUT
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$NEW"
+          git push origin "$NEW"
+
+      # ── Non-main: branch-sha label (no tag created) ──
+      - name: STG version label
+        id: stg
+        if: steps.ctx.outputs.is_main == 'false'
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          BRANCH=$(echo "${{ github.ref_name }}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          echo "version=${BRANCH}-${SHA}" >> $GITHUB_OUTPUT
+
+      - name: Resolve final version
+        id: resolve
+        run: |
+          if [ "${{ steps.ctx.outputs.is_main }}" = "true" ]; then
+            echo "version=${{ steps.bump.outputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ steps.stg.outputs.version }}" >> $GITHUB_OUTPUT
+          fi
+
+  # ─────────────────────────────────────────────
+  # 4. BUILD & PUSH  (linux/amd64 only)
+  # ─────────────────────────────────────────────
+  build:
+    name: Build & Push Docker
+    needs: version
+    if: github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # ── Main → latest + vX.Y.Z ──
+      - name: Build & Push (main)
+        if: needs.version.outputs.is_main == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          build-args: VERSION=${{ needs.version.outputs.version }}
+          tags: |
+            sdblepas/archive-mirror:latest
+            sdblepas/archive-mirror:${{ needs.version.outputs.version }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      # ── Non-main → STG + branch-sha ──
+      - name: Build & Push (STG)
+        if: needs.version.outputs.is_main == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          build-args: VERSION=${{ needs.version.outputs.version }}
+          tags: |
+            sdblepas/archive-mirror:STG
+            sdblepas/archive-mirror:${{ needs.version.outputs.version }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
