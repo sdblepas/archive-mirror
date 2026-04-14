@@ -1,15 +1,6 @@
 """
 Discovers all items in an Internet Archive collection via the scrape API.
-
-The scrape API supports cursor-based pagination and handles collections
-larger than the 10 000-row limit of the legacy advancedsearch endpoint.
-
-API reference:
-  GET https://archive.org/services/search/v1/scrape
-      ?q=collection:{collection}
-      &fields=identifier,title,date,creator,subject
-      &count=1000
-      &cursor={cursor}          ← omit on first request
+Supports cursor-based pagination for collections of any size.
 """
 from __future__ import annotations
 
@@ -36,15 +27,15 @@ class Discoverer:
         self._cfg = config
         self._client = client
 
-    async def iter_items(self) -> AsyncIterator[dict]:
-        """Yield every item dict in the collection, handling pagination."""
+    async def iter_items(self, collection: str) -> AsyncIterator[dict]:
+        """Yield every item dict in *collection*, handling cursor pagination."""
         cursor: Optional[str] = None
         page = 0
         total_yielded = 0
 
         while True:
             params: dict = {
-                "q": f"collection:{self._cfg.collection}",
+                "q": f"collection:{collection}",
                 "fields": _FIELDS,
                 "count": 1000,
             }
@@ -53,37 +44,36 @@ class Discoverer:
 
             log.info(
                 "discovery.fetch_page",
-                collection=self._cfg.collection,
+                collection=collection,
                 page=page,
                 cursor=cursor,
             )
 
-            data = await self._fetch_with_retry(params)
+            data = await self._fetch_with_retry(params, collection)
             items = data.get("items", [])
 
             if not items:
-                log.info("discovery.no_more_items", total=total_yielded)
+                log.info("discovery.no_more_items", collection=collection, total=total_yielded)
                 return
 
             for item in items:
                 yield item
                 total_yielded += 1
 
-            # Cursor absent or null → last page
             cursor = data.get("cursor")
             if not cursor:
                 log.info(
                     "discovery.complete",
+                    collection=collection,
                     total=total_yielded,
                     pages=page + 1,
                 )
                 return
 
             page += 1
-            # Be a good citizen: brief pause between discovery pages
             await asyncio.sleep(self._cfg.rate_limit_delay)
 
-    async def _fetch_with_retry(self, params: dict) -> dict:
+    async def _fetch_with_retry(self, params: dict, collection: str) -> dict:
         last_exc: Optional[Exception] = None
         for attempt in range(1, self._cfg.retry_count + 2):
             try:
@@ -93,22 +83,23 @@ class Discoverer:
                     timeout=self._cfg.request_timeout,
                 )
                 if response.status_code == 429:
-                    wait = 30 * attempt
+                    wait = int(response.headers.get("Retry-After", str(30 * attempt)))
                     log.warning(
                         "discovery.rate_limited",
-                        attempt=attempt,
+                        collection=collection,
                         wait_seconds=wait,
                     )
                     await asyncio.sleep(wait)
                     continue
                 response.raise_for_status()
                 return response.json()
-            except (httpx.HTTPError, Exception) as exc:
+            except (httpx.HTTPError, OSError, asyncio.TimeoutError) as exc:
                 last_exc = exc
                 if attempt <= self._cfg.retry_count:
                     wait = min(4 * 2 ** (attempt - 1), 120)
                     log.warning(
                         "discovery.fetch_error",
+                        collection=collection,
                         attempt=attempt,
                         error=str(exc),
                         wait_seconds=wait,
@@ -116,5 +107,6 @@ class Discoverer:
                     await asyncio.sleep(wait)
 
         raise DiscoveryError(
-            f"Failed to fetch discovery page after {self._cfg.retry_count + 1} attempts"
+            f"Failed to fetch discovery page for {collection} after "
+            f"{self._cfg.retry_count + 1} attempts"
         ) from last_exc

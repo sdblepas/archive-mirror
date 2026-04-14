@@ -3,8 +3,8 @@ Async file downloader with:
   - HTTP Range-header resume for partial downloads
   - MD5 / SHA-1 checksum validation
   - Configurable retry with exponential back-off
-  - Per-file .part staging to avoid corrupt finished files
-  - Semaphore-limited concurrency to avoid hammering IA
+  - .part staging + os.replace() atomic promotion
+  - Semaphore-limited concurrency
 """
 from __future__ import annotations
 
@@ -25,13 +25,12 @@ from .logger import get_logger
 log = get_logger(__name__)
 
 _IA_DOWNLOAD = "https://archive.org/download/{identifier}/{filename}"
-_CHUNK = 256 * 1024  # 256 KiB read/write chunks
+_CHUNK = 256 * 1024  # 256 KiB
 
 
 class DownloadResult(Enum):
     DOWNLOADED = auto()
     SKIPPED_EXISTING = auto()
-    SKIPPED_NO_FLAC = auto()
     FAILED = auto()
 
 
@@ -47,7 +46,6 @@ class Downloader:
     def __init__(self, config: Config, client: httpx.AsyncClient) -> None:
         self._cfg = config
         self._client = client
-        # One shared semaphore limits how many concurrent downloads run
         self._sem = asyncio.Semaphore(self._cfg.max_workers)
 
     async def download_track(
@@ -61,7 +59,6 @@ class Downloader:
         expected_md5: Optional[str] = None,
         expected_sha1: Optional[str] = None,
     ) -> DownloadOutcome:
-        """Download one FLAC track.  Acquires the shared semaphore."""
         async with self._sem:
             return await self._download(
                 identifier=identifier,
@@ -100,21 +97,19 @@ class Downloader:
                     result=DownloadResult.SKIPPED_EXISTING,
                     local_path=dest_path,
                 )
-            else:
-                log.warning(
-                    "download.existing_invalid",
-                    identifier=identifier,
-                    filename=local_filename,
-                    reason="size/checksum mismatch — redownloading",
-                )
-                dest_path.unlink(missing_ok=True)
+            log.warning(
+                "download.existing_invalid",
+                identifier=identifier,
+                filename=local_filename,
+                reason="size/checksum mismatch — redownloading",
+            )
+            dest_path.unlink(missing_ok=True)
 
         # ── 2. Determine resume offset ────────────────────────────────────
         resume_offset = 0
         if part_path.exists():
             resume_offset = part_path.stat().st_size
             if expected_size and resume_offset >= expected_size:
-                # Part file is unexpectedly large; restart
                 part_path.unlink()
                 resume_offset = 0
 
@@ -133,7 +128,6 @@ class Downloader:
                     identifier=identifier,
                     filename=local_filename,
                 )
-                # Rate-limit courtesy delay after each successful download
                 await asyncio.sleep(self._cfg.rate_limit_delay)
                 return outcome
             except _RetryableError as exc:
@@ -149,7 +143,6 @@ class Downloader:
                         wait_seconds=wait,
                     )
                     await asyncio.sleep(wait)
-                    # On retry, check if part file grew (partial resume worked)
                     if part_path.exists():
                         resume_offset = part_path.stat().st_size
             except _FatalError as exc:
@@ -162,10 +155,7 @@ class Downloader:
             filename=local_filename,
             error=last_error,
         )
-        return DownloadOutcome(
-            result=DownloadResult.FAILED,
-            error=last_error,
-        )
+        return DownloadOutcome(result=DownloadResult.FAILED, error=last_error)
 
     async def _attempt_download(
         self,
@@ -194,44 +184,38 @@ class Downloader:
             ) as response:
                 if response.status_code == 429:
                     wait = int(response.headers.get("Retry-After", "60"))
-                    log.warning(
-                        "download.rate_limited",
-                        identifier=identifier,
-                        filename=filename,
-                        wait_seconds=wait,
-                    )
                     await asyncio.sleep(wait)
                     raise _RetryableError("429 rate limited")
 
                 if response.status_code in (404, 403):
-                    raise _FatalError(
-                        f"HTTP {response.status_code} for {url}"
-                    )
+                    raise _FatalError(f"HTTP {response.status_code} for {url}")
 
                 if response.status_code not in (200, 206):
-                    raise _RetryableError(
-                        f"HTTP {response.status_code} for {url}"
-                    )
+                    raise _RetryableError(f"HTTP {response.status_code} for {url}")
 
-                # If server ignored our Range header, reset offset
-                if response.status_code == 200 and resume_offset > 0:
+                # ── BUG FIX: server ignored Range header → reset everything ──
+                server_ignored_range = (
+                    response.status_code == 200 and resume_offset > 0
+                )
+                if server_ignored_range:
                     resume_offset = 0
                     part_path.unlink(missing_ok=True)
 
-                mode = "ab" if resume_offset > 0 else "wb"
-                bytes_written = 0
-
+                # Initialise hash objects AFTER knowing whether we're resuming
                 md5_h = hashlib.md5()
                 sha1_h = hashlib.sha1()
 
-                # If resuming, pre-hash the existing bytes
+                # Pre-hash existing bytes only when server honoured the Range header
                 if resume_offset > 0 and part_path.exists():
                     async with aiofiles.open(part_path, "rb") as pf:
                         while chunk := await pf.read(_CHUNK):
                             md5_h.update(chunk)
                             sha1_h.update(chunk)
 
+                mode = "ab" if resume_offset > 0 else "wb"
+                bytes_written = 0
                 part_path.parent.mkdir(parents=True, exist_ok=True)
+
                 async with aiofiles.open(part_path, mode) as out:
                     async for chunk in response.aiter_bytes(chunk_size=_CHUNK):
                         await out.write(chunk)
@@ -239,12 +223,17 @@ class Downloader:
                         sha1_h.update(chunk)
                         bytes_written += len(chunk)
 
-        except (httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectTimeout,
-                httpx.ReadError, httpx.ConnectError, OSError) as exc:
+        except (
+            httpx.RemoteProtocolError,
+            httpx.ReadTimeout,
+            httpx.ConnectTimeout,
+            httpx.ReadError,
+            httpx.ConnectError,
+            OSError,
+        ) as exc:
             raise _RetryableError(str(exc)) from exc
 
         total_bytes = resume_offset + bytes_written
-
         log.info(
             "download.complete",
             identifier=identifier,
@@ -272,8 +261,8 @@ class Downloader:
                 f"Size mismatch: expected {expected_size}, got {total_bytes}"
             )
 
-        # ── Atomically promote .part → final path ─────────────────────────
-        part_path.rename(dest_path)
+        # ── Atomic promotion .part → final (os.replace is POSIX-atomic) ──
+        os.replace(str(part_path), str(dest_path))
 
         return DownloadOutcome(
             result=DownloadResult.DOWNLOADED,
@@ -283,7 +272,7 @@ class Downloader:
 
 
 # ---------------------------------------------------------------------------
-# Checksum helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _is_valid(
@@ -292,7 +281,6 @@ def _is_valid(
     expected_md5: Optional[str],
     expected_sha1: Optional[str],
 ) -> bool:
-    """Return True if the file passes all available integrity checks."""
     try:
         actual_size = path.stat().st_size
     except OSError:
@@ -301,7 +289,6 @@ def _is_valid(
     if expected_size is not None and actual_size != expected_size:
         return False
 
-    # Only compute checksum hashes if we have something to compare against
     if expected_md5 or expected_sha1:
         md5_h = hashlib.md5()
         sha1_h = hashlib.sha1()
@@ -312,7 +299,6 @@ def _is_valid(
                     sha1_h.update(chunk)
         except OSError:
             return False
-
         if expected_md5 and md5_h.hexdigest() != expected_md5:
             return False
         if expected_sha1 and sha1_h.hexdigest() != expected_sha1:
@@ -323,22 +309,17 @@ def _is_valid(
 
 async def write_checksum_manifest(
     folder: Path,
-    tracks: list[tuple[str, str]],  # (local_filename, md5)
+    tracks: list[tuple[str, str]],
 ) -> None:
-    """Write a ``checksums.md5`` file listing all downloaded tracks."""
     manifest_path = folder / "checksums.md5"
     lines = [f"{md5}  {name}\n" for name, md5 in sorted(tracks)]
     async with aiofiles.open(manifest_path, "w") as f:
         await f.writelines(lines)
 
 
-# ---------------------------------------------------------------------------
-# Internal sentinel exceptions
-# ---------------------------------------------------------------------------
-
 class _RetryableError(Exception):
-    """Transient failure; worth retrying."""
+    pass
 
 
 class _FatalError(Exception):
-    """Permanent failure; do not retry."""
+    pass
