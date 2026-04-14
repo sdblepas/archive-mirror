@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse
 
 from .config import Config
 from .database import Database
-from .routers import catalog, health, items, stats, syncs
+from .routers import catalog, health, items, scan, stats, syncs
 from .web_state import get_health_state, set_health  # re-exported for scheduler
 
 __all__ = ["create_app", "set_health", "get_health_state"]
@@ -45,6 +45,7 @@ def create_app(config: Config, db: Database) -> FastAPI:
     app.include_router(syncs.router)
     app.include_router(items.router)
     app.include_router(catalog.router)
+    app.include_router(scan.router)
 
     # ── Dashboard SPA ─────────────────────────────────────────────────────
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -82,6 +83,14 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     <div class="flex items-center gap-3">
       <span class="text-xs text-gray-400" x-text="lastRefresh ? 'Updated ' + lastRefresh : ''"></span>
+      <!-- Scan button -->
+      <button @click="triggerScan()"
+              :disabled="scanRunning"
+              :class="scanRunning ? 'opacity-50 cursor-not-allowed' : 'hover:bg-indigo-500'"
+              class="flex items-center gap-1.5 bg-indigo-600 text-white text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">
+        <span x-show="!scanRunning">🔍 Scan for new</span>
+        <span x-show="scanRunning" x-cloak>⏳ Scanning…</span>
+      </button>
       <span :class="healthDot" class="inline-block w-3 h-3 rounded-full"></span>
       <span class="text-sm font-medium" x-text="healthLabel"></span>
     </div>
@@ -103,17 +112,39 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </section>
 
-  <!-- Last sync summary -->
-  <section x-show="lastSync" x-cloak>
-    <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-4">Last sync</h2>
-    <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-5 grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
-      <div><p class="text-gray-500 text-xs mb-1">Started</p><p class="font-medium" x-text="fmtDate(lastSync?.started_at)"></p></div>
-      <div><p class="text-gray-500 text-xs mb-1">Duration</p><p class="font-medium" x-text="syncDuration(lastSync)"></p></div>
-      <div><p class="text-gray-500 text-xs mb-1">Tracks downloaded</p><p class="font-medium text-green-700" x-text="(lastSync?.tracks_downloaded||0).toLocaleString()"></p></div>
-      <div><p class="text-gray-500 text-xs mb-1">Failures</p>
-        <p class="font-medium" :class="lastSync?.tracks_failed > 0 ? 'text-red-600' : 'text-gray-700'" x-text="lastSync?.tracks_failed||0"></p></div>
-    </div>
-  </section>
+  <!-- Last scan + last sync summary -->
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+    <!-- Last scan -->
+    <section>
+      <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-4">Last scan (IA discovery)</h2>
+      <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-5 h-full">
+        <template x-if="!lastScanAt">
+          <p class="text-sm text-gray-400">No scan run yet — click <strong>Scan for new</strong> to discover concerts.</p>
+        </template>
+        <template x-if="lastScanAt">
+          <div class="grid grid-cols-3 gap-4 text-sm">
+            <div><p class="text-gray-500 text-xs mb-1">Scanned at</p><p class="font-medium" x-text="fmtDate(lastScanAt)"></p></div>
+            <div><p class="text-gray-500 text-xs mb-1">Discovered</p><p class="font-medium" x-text="(lastScanStats?.items_discovered||0).toLocaleString()"></p></div>
+            <div><p class="text-gray-500 text-xs mb-1">New concerts</p><p class="font-medium text-indigo-600" x-text="(lastScanStats?.items_new||0).toLocaleString()"></p></div>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- Last download run -->
+    <section x-show="lastSync" x-cloak>
+      <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-4">Last download run</h2>
+      <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-5 grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
+        <div><p class="text-gray-500 text-xs mb-1">Started</p><p class="font-medium" x-text="fmtDate(lastSync?.started_at)"></p></div>
+        <div><p class="text-gray-500 text-xs mb-1">Duration</p><p class="font-medium" x-text="syncDuration(lastSync)"></p></div>
+        <div><p class="text-gray-500 text-xs mb-1">Tracks downloaded</p><p class="font-medium text-green-700" x-text="(lastSync?.tracks_downloaded||0).toLocaleString()"></p></div>
+        <div><p class="text-gray-500 text-xs mb-1">Failures</p>
+          <p class="font-medium" :class="lastSync?.tracks_failed > 0 ? 'text-red-600' : 'text-gray-700'" x-text="lastSync?.tracks_failed||0"></p></div>
+      </div>
+    </section>
+
+  </div>
 
   <!-- Sync history -->
   <section>
@@ -280,10 +311,13 @@ function app() {
     items:[], totalItems:0, currentPage:1, totalPages:1,
     search:'', filterStatus:'', itemsLoading:false,
     selectedItem:null, selectedTracks:[],
+    scanRunning:false, lastScanAt:null, lastScanStats:null,
 
     async init() {
-      await Promise.all([this.loadStats(), this.loadSyncs(), this.fetchItems(1)]);
+      await Promise.all([this.loadStats(), this.loadSyncs(), this.fetchItems(1), this.loadScanStatus()]);
       setInterval(() => { this.loadStats(); this.loadSyncs(); }, 30000);
+      // Poll scan status every 3 s while a scan is running
+      setInterval(() => { if(this.scanRunning) this.loadScanStatus(); }, 3000);
     },
 
     async loadStats() {
@@ -306,6 +340,30 @@ function app() {
           {label:"Tracks DL'd",  value:tr.complete||0,   color:'text-indigo-600'},
         ];
       } catch(e){console.error('stats',e);}
+    },
+
+    async loadScanStatus() {
+      try {
+        const d = await fetch('/api/scan/status').then(r=>r.json());
+        const wasRunning = this.scanRunning;
+        this.scanRunning = d.running||false;
+        this.lastScanAt  = d.last_scan_at||null;
+        this.lastScanStats = d.last_scan_stats||null;
+        // Refresh item list when a scan just finished
+        if(wasRunning && !this.scanRunning) {
+          await Promise.all([this.loadStats(), this.fetchItems(this.currentPage)]);
+        }
+      } catch(e){console.error('scan status',e);}
+    },
+
+    async triggerScan() {
+      if(this.scanRunning) return;
+      try {
+        const r = await fetch('/api/scan', {method:'POST'});
+        if(r.status===202) { this.scanRunning=true; }
+        else if(r.status===409) { alert('A scan is already running.'); }
+        else { alert('Failed to start scan: '+r.status); }
+      } catch(e){ console.error('scan trigger',e); }
     },
 
     async loadSyncs() {

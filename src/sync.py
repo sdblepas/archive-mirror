@@ -1,8 +1,18 @@
 """
 SyncManager – the main orchestrator.
 
-Supports multiple collections via config.collections (comma-separated).
-One full sync cycle per collection, sequential to avoid hammering IA.
+Two separate phases, each independently callable:
+
+  run_discovery()  – Crawl IA (slow, network-bound).  Upserts every item
+                     found into the DB with status=pending.  Safe to re-run:
+                     existing items are untouched.
+
+  run_downloads()  – Work off the DB.  Downloads every pending/retryable item.
+                     No IA crawling.  Safe to call after a container restart:
+                     picks up exactly where the last run left off.
+
+  run_sync()       – Convenience wrapper: discovery followed by downloads.
+                     Used for the initial one-shot run when the DB is empty.
 """
 from __future__ import annotations
 
@@ -31,59 +41,48 @@ from .tagger import tag_flac
 
 log = get_logger(__name__)
 
+_UA = (
+    "archive-mirror/1.0 "
+    "(https://github.com/sdblepas/archive-mirror; respectful bot)"
+)
+
+
+def _make_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        headers={"User-Agent": _UA},
+        follow_redirects=True,
+        limits=httpx.Limits(
+            max_keepalive_connections=10,
+            max_connections=20,
+            keepalive_expiry=30,
+        ),
+    )
+
 
 class SyncManager:
     def __init__(self, config: Config, db: Database) -> None:
         self._cfg = config
         self._db = db
 
-    # ── Public entry point ───────────────────────────────────────────────────
+    # ── Discovery ─────────────────────────────────────────────────────────────
 
-    async def run_sync(self) -> dict:
-        """Run a full sync across all configured collections."""
-        run_id = str(uuid.uuid4())
-        await self._db.start_sync_run(run_id)
+    async def run_discovery(self) -> dict:
+        """Crawl all configured IA collections → upsert into DB.
 
-        stats: dict = {
-            "run_id": run_id,
-            "items_discovered": 0,
-            "items_new": 0,
-            "items_with_flac": 0,
-            "items_skipped": 0,
-            "items_completed": 0,
-            "tracks_downloaded": 0,
-            "tracks_failed": 0,
-        }
+        Only inserts new items (status=pending).  Items already in the DB are
+        left completely untouched so in-progress downloads are not disrupted.
 
-        log.info(
-            "sync.start",
-            run_id=run_id,
-            collections=self._cfg.collections,
-            dry_run=self._cfg.dry_run,
-        )
+        Returns {"items_discovered": N, "items_new": N}.
+        """
+        stats: dict = {"items_discovered": 0, "items_new": 0}
 
-        limits = httpx.Limits(
-            max_keepalive_connections=10,
-            max_connections=20,
-            keepalive_expiry=30,
-        )
-        headers = {
-            "User-Agent": (
-                "archive-mirror/1.0 "
-                "(https://github.com/sdblepas/archive-mirror; respectful bot)"
-            )
-        }
+        log.info("discovery.start", collections=self._cfg.collections)
 
-        async with httpx.AsyncClient(
-            headers=headers, follow_redirects=True, limits=limits
-        ) as client:
+        async with _make_client() as client:
             discoverer = Discoverer(self._cfg, client)
-            metadata_fetcher = MetadataFetcher(self._cfg, client)
-            downloader = Downloader(self._cfg, client)
 
-            # ── Phase 1: Discover all collections ────────────────────────
             for collection in self._cfg.collections:
-                log.info("sync.discovery_start", collection=collection)
+                log.info("discovery.collection_start", collection=collection)
                 async for item_stub in discoverer.iter_items(collection):
                     identifier = item_stub.get("identifier", "")
                     if not identifier:
@@ -99,58 +98,84 @@ class SyncManager:
                     if is_new:
                         stats["items_new"] += 1
 
-            log.info(
-                "sync.discovery_complete",
-                discovered=stats["items_discovered"],
-                new=stats["items_new"],
-            )
-            await self._db.update_sync_run(
-                run_id,
-                items_discovered=stats["items_discovered"],
-                items_new=stats["items_new"],
-            )
+        log.info(
+            "discovery.complete",
+            discovered=stats["items_discovered"],
+            new=stats["items_new"],
+        )
+        return stats
 
-            # ── Phase 2: Build work list ──────────────────────────────────
-            pending = await self._db.get_items_by_status("pending")
-            retryable = await self._db.get_items_for_retry(self._cfg.retry_count)
+    # ── Downloads ─────────────────────────────────────────────────────────────
 
-            seen: set[str] = set()
-            work_list: list[dict] = []
-            for item in pending + retryable:
-                if item["identifier"] not in seen:
-                    seen.add(item["identifier"])
-                    work_list.append(item)
+    async def run_downloads(self) -> dict:
+        """Download all pending/retryable items from the DB.
 
-            status_counts = await self._db.count_items_by_status()
-            stats["items_skipped"] = (
-                status_counts.get("complete", 0) + status_counts.get("no_flac", 0)
-            )
+        Does NOT touch IA discovery.  Creates a sync_run record in the DB so
+        the history table stays accurate.
 
-            log.info(
-                "sync.work_list_ready",
-                to_process=len(work_list),
-                already_skipped=stats["items_skipped"],
-            )
+        Returns full stats dict.
+        """
+        run_id = str(uuid.uuid4())
+        await self._db.start_sync_run(run_id)
 
-            if not work_list:
-                log.info("sync.nothing_to_do")
-                await self._db.finish_sync_run(run_id, status="complete", **stats)
-                return stats
+        stats: dict = {
+            "run_id": run_id,
+            "items_discovered": 0,
+            "items_new": 0,
+            "items_with_flac": 0,
+            "items_skipped": 0,
+            "items_completed": 0,
+            "tracks_downloaded": 0,
+            "tracks_failed": 0,
+        }
 
-            if self._cfg.dry_run:
-                log.info("sync.dry_run_mode", would_process=len(work_list))
-                for item in work_list:
-                    log.info(
-                        "dry_run.would_process",
-                        identifier=item["identifier"],
-                        title=item.get("title"),
-                    )
-                await self._db.finish_sync_run(run_id, status="complete", **stats)
-                return stats
+        log.info("downloads.start", run_id=run_id, dry_run=self._cfg.dry_run)
 
-            # ── Phase 3: Process items with bounded concurrency ───────────
-            sem = asyncio.Semaphore(self._cfg.max_workers)
-            lock = asyncio.Lock()
+        # ── Build work list ───────────────────────────────────────────────
+        pending = await self._db.get_items_by_status("pending")
+        retryable = await self._db.get_items_for_retry(self._cfg.retry_count)
+
+        seen: set[str] = set()
+        work_list: list[dict] = []
+        for item in pending + retryable:
+            if item["identifier"] not in seen:
+                seen.add(item["identifier"])
+                work_list.append(item)
+
+        status_counts = await self._db.count_items_by_status()
+        stats["items_skipped"] = (
+            status_counts.get("complete", 0) + status_counts.get("no_flac", 0)
+        )
+
+        log.info(
+            "downloads.work_list_ready",
+            to_process=len(work_list),
+            already_done=stats["items_skipped"],
+        )
+
+        if not work_list:
+            log.info("downloads.nothing_to_do")
+            await self._db.finish_sync_run(run_id, status="complete", **stats)
+            return stats
+
+        if self._cfg.dry_run:
+            log.info("downloads.dry_run_mode", would_process=len(work_list))
+            for item in work_list:
+                log.info(
+                    "dry_run.would_process",
+                    identifier=item["identifier"],
+                    title=item.get("title"),
+                )
+            await self._db.finish_sync_run(run_id, status="complete", **stats)
+            return stats
+
+        # ── Process items concurrently ────────────────────────────────────
+        sem = asyncio.Semaphore(self._cfg.max_workers)
+        lock = asyncio.Lock()
+
+        async with _make_client() as client:
+            metadata_fetcher = MetadataFetcher(self._cfg, client)
+            downloader = Downloader(self._cfg, client)
 
             async def process_one(item: dict) -> None:
                 async with sem:
@@ -163,15 +188,27 @@ class SyncManager:
 
             await asyncio.gather(*(process_one(item) for item in work_list))
 
-        log.info("sync.complete", **stats)
+            if self._cfg.webhook_url:
+                await self._post_webhook(client, stats)
+
+        log.info("downloads.complete", **stats)
         await self._db.finish_sync_run(run_id, status="complete", **stats)
-
-        if self._cfg.webhook_url:
-            await self._post_webhook(client, stats)
-
         return stats
 
-    # ── Per-item processing ──────────────────────────────────────────────────
+    # ── Full cycle (discovery + downloads) ────────────────────────────────────
+
+    async def run_sync(self) -> dict:
+        """Convenience: run_discovery() then run_downloads().
+
+        Use this for first-time setup (empty DB) or one-shot mode
+        (SYNC_INTERVAL=0).
+        """
+        disc = await self.run_discovery()
+        dl = await self.run_downloads()
+        # Merge: preserve run_id from downloads; surface discovery counts.
+        return {**dl, "items_discovered": disc["items_discovered"], "items_new": disc["items_new"]}
+
+    # ── Per-item processing ───────────────────────────────────────────────────
 
     async def _process_item(
         self,
@@ -189,7 +226,7 @@ class SyncManager:
 
         await self._db.mark_item_status(identifier, "downloading")
 
-        # ── Fetch metadata ───────────────────────────────────────────────
+        # ── Fetch IA metadata ─────────────────────────────────────────────
         try:
             concert = await metadata_fetcher.fetch(identifier)
         except Exception:
@@ -360,14 +397,11 @@ class SyncManager:
         result["tracks_failed"] = tracks_fail
         return result
 
-    # ── Webhook ──────────────────────────────────────────────────────────────
+    # ── Webhook ───────────────────────────────────────────────────────────────
 
     async def _post_webhook(self, client: httpx.AsyncClient, stats: dict) -> None:
-        """Reuse the existing pooled client for the webhook POST."""
         try:
-            await client.post(
-                self._cfg.webhook_url, json=stats, timeout=15
-            )
+            await client.post(self._cfg.webhook_url, json=stats, timeout=15)
             log.info("webhook.sent", url=self._cfg.webhook_url)
         except Exception:
             log.exception("webhook.failed", url=self._cfg.webhook_url)
