@@ -159,12 +159,17 @@ class SyncManager:
             return stats
 
         if self._cfg.dry_run:
-            log.info("downloads.dry_run_mode", would_process=len(work_list))
+            log.info(
+                "downloads.dry_run_mode",
+                would_process=len(work_list),
+                already_complete=stats["items_skipped"],
+            )
             for item in work_list:
                 log.info(
                     "dry_run.would_process",
                     identifier=item["identifier"],
                     title=item.get("title"),
+                    status=item.get("status"),
                 )
             await self._db.finish_sync_run(run_id, status="complete", **stats)
             return stats
@@ -243,6 +248,14 @@ class SyncManager:
             )
             return result
 
+        raw_json = json.dumps(concert.raw)
+        if len(raw_json) > 500_000:  # 500 KB safety cap — discard rather than truncate
+            log.warning(
+                "sync.raw_metadata_too_large",
+                identifier=identifier,
+                size=len(raw_json),
+            )
+            raw_json = "{}"
         await self._db.update_item(
             identifier,
             title=concert.title,
@@ -250,7 +263,7 @@ class SyncManager:
             date=concert.date,
             venue=concert.venue,
             description=concert.description,
-            raw_metadata=json.dumps(concert.raw),
+            raw_metadata=raw_json,
         )
 
         if not concert.flac_tracks:
@@ -400,11 +413,26 @@ class SyncManager:
     # ── Webhook ───────────────────────────────────────────────────────────────
 
     async def _post_webhook(self, client: httpx.AsyncClient, stats: dict) -> None:
-        try:
-            await client.post(self._cfg.webhook_url, json=stats, timeout=15)
-            log.info("webhook.sent", url=self._cfg.webhook_url)
-        except Exception:
-            log.exception("webhook.failed", url=self._cfg.webhook_url)
+        """POST stats to webhook with up to 3 attempts and exponential backoff."""
+        for attempt in range(1, 4):
+            try:
+                resp = await client.post(
+                    self._cfg.webhook_url, json=stats, timeout=15
+                )
+                resp.raise_for_status()
+                log.info("webhook.sent", url=self._cfg.webhook_url, attempt=attempt)
+                return
+            except Exception as exc:
+                if attempt < 3:
+                    wait = 2 ** attempt  # 2 s, 4 s
+                    log.warning(
+                        "webhook.retry",
+                        attempt=attempt,
+                        wait_seconds=wait,
+                        error=str(exc),
+                    )
+                    await asyncio.sleep(wait)
+        log.error("webhook.failed_all_attempts", url=self._cfg.webhook_url)
 
 
 # ---------------------------------------------------------------------------

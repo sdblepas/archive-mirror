@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+import sqlite3
+
 import aiosqlite
 
 from .logger import get_logger
@@ -158,14 +160,23 @@ class Database:
         log.info("database.connected", path=str(self._path))
 
     async def _run_migrations(self, conn: aiosqlite.Connection) -> None:
-        for sql in _MIGRATIONS:
+        for i, sql in enumerate(_MIGRATIONS):
             try:
                 await conn.execute(sql)
                 await conn.commit()
-                log.info("database.migration_applied", sql=sql[:60])
-            except Exception:
-                # Column already exists — expected on all runs after the first
-                pass
+                log.info("database.migration_applied", idx=i, sql=sql[:60])
+            except sqlite3.OperationalError as exc:
+                # Idempotent: "already exists" / "duplicate column name" are expected
+                # on every run after the first migration.  Any other OperationalError
+                # (e.g. disk full, locked db, schema corruption) must propagate.
+                msg = str(exc).lower()
+                if "already exists" in msg or "duplicate column" in msg:
+                    log.debug("database.migration_skipped", idx=i, reason=str(exc))
+                else:
+                    log.error(
+                        "database.migration_failed", idx=i, sql=sql[:80], error=str(exc)
+                    )
+                    raise
 
     async def close(self) -> None:
         if self._conn:
@@ -427,6 +438,30 @@ class Database:
             (item_identifier,),
         )
         return [dict(r) for r in await cur.fetchall()]
+
+    async def get_tracks_for_items_bulk(
+        self, identifiers: list[str]
+    ) -> dict[str, list[dict]]:
+        """Fetch all tracks for multiple items in a single query.
+
+        Returns a mapping ``{identifier: [track, …]}`` ordered by
+        track_number then ia_filename within each item.  Avoids the N+1
+        query pattern in catalog export.
+        """
+        if not identifiers:
+            return {}
+        conn = self._conn_or_raise()
+        placeholders = ",".join("?" * len(identifiers))
+        cur = await conn.execute(
+            f"SELECT * FROM tracks WHERE item_identifier IN ({placeholders}) "
+            "ORDER BY item_identifier, track_number, ia_filename",
+            identifiers,
+        )
+        result: dict[str, list[dict]] = {iid: [] for iid in identifiers}
+        for row in await cur.fetchall():
+            d = dict(row)
+            result[d["item_identifier"]].append(d)
+        return result
 
     async def count_tracks(self) -> dict[str, int]:
         conn = self._conn_or_raise()

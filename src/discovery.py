@@ -5,6 +5,7 @@ Supports cursor-based pagination for collections of any size.
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import AsyncIterator, Optional
 
 import httpx
@@ -27,8 +28,18 @@ class Discoverer:
         self._cfg = config
         self._client = client
 
+    _COLLECTION_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$')
+
     async def iter_items(self, collection: str) -> AsyncIterator[dict]:
         """Yield every item dict in *collection*, handling cursor pagination."""
+        if not self._COLLECTION_RE.match(collection):
+            log.error(
+                "discovery.invalid_collection_name",
+                collection=collection,
+                reason="must match [a-zA-Z0-9][a-zA-Z0-9_-]*",
+            )
+            return
+
         cursor: Optional[str] = None
         page = 0
         total_yielded = 0

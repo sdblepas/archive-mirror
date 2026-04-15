@@ -195,14 +195,23 @@ def _normalise_date(raw: Optional[str]) -> str:
 
 
 def _parse_track_number(raw: object) -> Optional[int]:
+    """Parse "1", "01", "1/12", etc.
+
+    Values outside 1–9999 are treated as missing: a malformed IA record
+    with track="9999999999" must not produce filenames with hundreds of
+    digits or overflow the SQLite INTEGER column.
+    """
     s = _coerce_str(raw)
     if not s:
         return None
     s = s.split("/")[0].strip()
     try:
-        return int(s)
+        num = int(s)
     except ValueError:
         return None
+    if num < 1 or num > 9999:
+        return None
+    return num
 
 
 def _safe_int(val: object) -> Optional[int]:

@@ -33,11 +33,14 @@ async def export_catalog(config: Config, db: Database) -> dict[str, int]:
         status="complete", per_page=100_000
     )
 
+    # Fetch all tracks in one query instead of one per item (avoids N+1)
+    identifiers = [item["identifier"] for item in items]
+    tracks_by_item = await db.get_tracks_for_items_bulk(identifiers)
+
     rows: list[dict[str, Any]] = []
     csv_rows: list[dict[str, str]] = []
 
     for item in items:
-        tracks = await db.get_tracks_for_item(item["identifier"])
         track_list = [
             {
                 "ia_filename": t["ia_filename"],
@@ -47,7 +50,7 @@ async def export_catalog(config: Config, db: Database) -> dict[str, int]:
                 "track_number": t["track_number"],
                 "md5": t["md5"],
             }
-            for t in tracks
+            for t in tracks_by_item.get(item["identifier"], [])
             if t["status"] == "complete"
         ]
 

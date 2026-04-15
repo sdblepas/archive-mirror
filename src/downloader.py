@@ -81,13 +81,27 @@ class Downloader:
         expected_md5: Optional[str],
         expected_sha1: Optional[str],
     ) -> DownloadOutcome:
+        # ── Guard against path traversal ─────────────────────────────────
+        # make_track_filename() already strips '/', but defence-in-depth:
+        # verify the resolved destination is still inside dest_dir.
         dest_path = dest_dir / local_filename
+        try:
+            dest_path.resolve().relative_to(dest_dir.resolve())
+        except ValueError:
+            raise _FatalError(
+                f"Path traversal detected in filename: {local_filename!r}"
+            )
         part_path = dest_dir / (local_filename + ".part")
         url = _IA_DOWNLOAD.format(identifier=identifier, filename=ia_filename)
 
         # ── 1. Check if file is already complete ─────────────────────────
         if dest_path.exists():
-            if _is_valid(dest_path, expected_size, expected_md5, expected_sha1):
+            # Run the synchronous hash-check in a thread so we don't block
+            # the event loop while reading a large FLAC file.
+            valid = await asyncio.to_thread(
+                _is_valid, dest_path, expected_size, expected_md5, expected_sha1
+            )
+            if valid:
                 log.debug(
                     "download.skip_existing",
                     identifier=identifier,
