@@ -25,7 +25,24 @@ log = get_logger(__name__)
 
 
 async def export_catalog(config: Config, db: Database) -> dict[str, int]:
-    """Build and write catalog files. Returns summary counts."""
+    """Build and write catalog files. Returns summary counts.
+
+    Output paths are validated to be inside state_dir before any I/O so
+    that a misconfigured or adversarially-supplied Config cannot write
+    files outside the designated state directory.
+    """
+    # ── Path confinement guard ────────────────────────────────────────────
+    state_dir = config.state_dir.resolve()
+    json_path = config.catalog_json_path.resolve()
+    csv_path = config.catalog_csv_path.resolve()
+    for label, path in (("JSON", json_path), ("CSV", csv_path)):
+        try:
+            path.relative_to(state_dir)
+        except ValueError:
+            raise RuntimeError(
+                f"Catalog {label} path {path!r} escapes state_dir {state_dir!r}"
+            )
+
     log.info("catalog.export_start")
 
     # Fetch all complete items and their tracks
@@ -94,11 +111,11 @@ async def export_catalog(config: Config, db: Database) -> dict[str, int]:
         "items": rows,
     }
 
-    # ── Write JSON ────────────────────────────────────────────────────────
-    async with aiofiles.open(config.catalog_json_path, "w", encoding="utf-8") as f:
+    # ── Write JSON (use pre-validated resolved path) ──────────────────────
+    async with aiofiles.open(json_path, "w", encoding="utf-8") as f:
         await f.write(json.dumps(catalog, indent=2, ensure_ascii=False))
 
-    # ── Write CSV ─────────────────────────────────────────────────────────
+    # ── Write CSV (use pre-validated resolved path) ───────────────────────
     fieldnames = [
         "identifier", "collection", "artist", "date", "venue",
         "folder", "track_number", "title", "local_filename",
@@ -112,15 +129,15 @@ async def export_catalog(config: Config, db: Database) -> dict[str, int]:
                 for f in fieldnames
             )
         )
-    async with aiofiles.open(config.catalog_csv_path, "w", encoding="utf-8") as f:
+    async with aiofiles.open(csv_path, "w", encoding="utf-8") as f:
         await f.write("\n".join(csv_text_rows) + "\n")
 
     log.info(
         "catalog.export_done",
         items=len(rows),
         tracks=len(csv_rows),
-        json_path=str(config.catalog_json_path),
-        csv_path=str(config.catalog_csv_path),
+        json_path=str(json_path),
+        csv_path=str(csv_path),
     )
 
     return {"items": len(rows), "tracks": len(csv_rows)}
